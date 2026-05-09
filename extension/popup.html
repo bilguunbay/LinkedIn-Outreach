@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LinkedIn Outreach</title>
+  <style>
+    body {
+      width: 600px;
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+    }
+    .app { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+    h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    .sub { margin: 0; font-size: 12px; color: #64748b; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .between { justify-content: space-between; }
+
+    button {
+      padding: 6px 10px;
+      font-size: 13px;
+      border: 1px solid #cbd5e1;
+      background: #fff;
+      border-radius: 6px;
+      cursor: pointer;
+      color: #0f172a;
+    }
+    button:hover { background: #f1f5f9; }
+    button.danger { color: #b91c1c; border-color: #fca5a5; }
+    button.danger:hover { background: #fee2e2; }
+
+    .summary { font-size: 12px; color: #475569; }
+    .summary strong { color: #0f172a; }
+    .err { color: #b91c1c; font-size: 12px; }
+
+    input[type="file"] { font-size: 13px; }
+
+    .upload-card {
+      padding: 16px;
+      border: 1px dashed #cbd5e1;
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    /* Table */
+    .table-wrap {
+      max-height: 320px;
+      overflow: auto;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      background: #fff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    thead {
+      position: sticky;
+      top: 0;
+      background: #f1f5f9;
+      z-index: 1;
+    }
+    th, td {
+      padding: 6px 8px;
+      text-align: left;
+      border-bottom: 1px solid #e2e8f0;
+      vertical-align: top;
+    }
+    th { font-weight: 600; color: #0f172a; }
+    td { color: #334155; }
+    td a { color: #2563eb; text-decoration: none; }
+    td a:hover { text-decoration: underline; }
+
+    /* Skipped */
+    details {
+      border: 1px solid #fde68a;
+      border-radius: 6px;
+      background: #fffbeb;
+    }
+    details summary {
+      cursor: pointer;
+      font-size: 12px;
+      color: #92400e;
+      padding: 8px 10px;
+      font-weight: 500;
+    }
+    details[open] summary { border-bottom: 1px solid #fde68a; }
+    .skipped-list {
+      margin: 0;
+      padding: 8px 12px 8px 28px;
+      max-height: 240px;
+      overflow: auto;
+      font-size: 12px;
+      color: #78350f;
+    }
+    .skipped-list li { margin-bottom: 8px; }
+    .raw-detail {
+      margin-top: 2px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 11px;
+      color: #92400e;
+      opacity: 0.85;
+      word-break: break-word;
+    }
+
+    /* Detected columns diagnostic */
+    .detected-cols {
+      font-size: 12px;
+      color: #475569;
+      padding: 8px 10px;
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+    .detected-cols code {
+      background: #fff;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 11px;
+    }
+    .col-ok    { color: #166534; }
+    .col-skip  { color: #92400e; }
+
+    /* Empty-results notice (0 valid) */
+    .empty-results {
+      padding: 12px;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 6px;
+      font-size: 13px;
+      color: #7f1d1d;
+    }
+    .empty-results strong { color: #991b1b; }
+
+    /* ============================================================
+       Template editor (step 2)
+       ============================================================ */
+    .template-section {
+      margin-top: 6px;
+      padding-top: 14px;
+      border-top: 1px solid #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .section-header {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .section-header h2 {
+      margin: 0;
+      font-size: 11px;
+      font-weight: 600;
+      color: #475569;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .preview-target {
+      font-weight: 400;
+      color: #64748b;
+      font-size: 11px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .template-controls {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    #template-select {
+      flex: 1;
+      padding: 5px 8px;
+      font-size: 13px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #fff;
+      cursor: pointer;
+      color: #0f172a;
+    }
+    #template-body {
+      width: 100%;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      padding: 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      resize: vertical;
+      background: #fff;
+      color: #0f172a;
+      box-sizing: border-box;
+      min-height: 140px;
+    }
+    #template-body:focus {
+      outline: 2px solid #3b82f6;
+      outline-offset: -1px;
+      border-color: #3b82f6;
+    }
+    .template-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      font-size: 11px;
+      color: #64748b;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .vars { flex: 1; }
+    .var-chip {
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 10px;
+      margin-right: 2px;
+      cursor: pointer;
+      transition: background 100ms;
+      color: #334155;
+    }
+    .var-chip:hover { background: #e2e8f0; }
+    .meta-right {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      white-space: nowrap;
+    }
+    .char-count { font-variant-numeric: tabular-nums; }
+    .char-count[data-state="warning"] { color: #92400e; font-weight: 500; }
+    .char-count[data-state="over"]    { color: #b91c1c; font-weight: 600; }
+    .save-indicator {
+      color: #16a34a;
+      opacity: 0;
+      transition: opacity 200ms;
+      font-size: 11px;
+    }
+    .save-indicator.show { opacity: 1; }
+
+    .preview-body {
+      margin: 6px 0 0 0;
+      padding: 10px;
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #1e293b;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 60px;
+    }
+    .preview-empty {
+      color: #94a3b8;
+      font-style: italic;
+    }
+
+    /* Send button + status */
+    .send-section {
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .send-btn {
+      padding: 10px 14px;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 100ms;
+    }
+    .send-btn:hover:not(:disabled) { background: #1d4ed8; }
+    .send-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .send-status {
+      display: none;
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .send-status.show { display: block; }
+    .send-status.pending {
+      background: #eff6ff;
+      color: #1d4ed8;
+      border: 1px solid #bfdbfe;
+    }
+    .send-status.ok {
+      background: #f0fdf4;
+      color: #166534;
+      border: 1px solid #86efac;
+    }
+    .send-status.err {
+      background: #fef2f2;
+      color: #991b1b;
+      border: 1px solid #fca5a5;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div>
+      <h1>LinkedIn Outreach</h1>
+      <p class="sub">Step 1: import contacts</p>
+    </div>
+
+    <div id="error" class="err"></div>
+
+    <!-- Empty state -->
+    <div id="empty-view" class="upload-card">
+      <p class="sub" style="margin-bottom: 12px;">
+        Drop in a CSV or PDF. Required columns:
+        <strong>company</strong>, <strong>name</strong>, <strong>role</strong>, <strong>linkedin url</strong>.
+        Header naming is flexible.
+      </p>
+      <input id="file" type="file" accept=".csv,.pdf,text/csv,application/pdf" />
+    </div>
+
+    <!-- Loaded state -->
+    <div id="loaded-view" style="display: none; flex-direction: column; gap: 12px;">
+      <div class="row between">
+        <div id="summary" class="summary"></div>
+        <div class="row">
+          <button id="replace-btn">Upload new file</button>
+          <button id="clear-btn" class="danger">Clear</button>
+        </div>
+      </div>
+
+      <div id="detected-cols" class="detected-cols" style="display: none;"></div>
+
+      <div id="empty-results" class="empty-results" style="display: none;">
+        <strong>No rows passed validation.</strong>
+        Check the "Detected columns" above — if your headers aren't recognized,
+        rename them or expand the alias list. The "Skipped" section below shows
+        why each row was rejected.
+      </div>
+
+      <details id="skipped" style="display: none;">
+        <summary>Skipped (<span id="skipped-count">0</span>)</summary>
+        <ul id="skipped-list" class="skipped-list"></ul>
+      </details>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Company</th>
+              <th>Name</th>
+              <th>Role</th>
+              <th>LinkedIn</th>
+            </tr>
+          </thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+
+      <!-- Template editor (step 2) -->
+      <section id="template-section" class="template-section" style="display: none;">
+        <div class="section-header">
+          <h2>Message template</h2>
+        </div>
+
+        <div class="template-controls">
+          <select id="template-select"></select>
+          <button id="template-new" type="button">+ New</button>
+          <button id="template-delete" type="button" class="danger">Delete</button>
+        </div>
+
+        <textarea id="template-body" rows="9" spellcheck="true"
+                  placeholder="Hi {{name}}, ..."></textarea>
+
+        <div class="template-meta">
+          <div class="vars">
+            Variables (click to insert):
+            <code class="var-chip" data-var="{{name}}">{{name}}</code>
+            <code class="var-chip" data-var="{{full_name}}">{{full_name}}</code>
+            <code class="var-chip" data-var="{{company}}">{{company}}</code>
+            <code class="var-chip" data-var="{{role}}">{{role}}</code>
+            <code class="var-chip" data-var="{{ai_personalization}}">{{ai_personalization}}</code>
+          </div>
+          <div class="meta-right">
+            <span id="save-indicator" class="save-indicator">saved</span>
+            <span id="char-count" class="char-count">0 / 1900</span>
+          </div>
+        </div>
+
+        <div class="section-header" style="margin-top: 4px;">
+          <h2>Preview</h2>
+          <span id="preview-target" class="preview-target"></span>
+        </div>
+        <pre id="preview-body" class="preview-body"></pre>
+
+        <div class="send-section">
+          <button id="send-btn" class="send-btn" disabled>Send</button>
+          <div id="send-status" class="send-status"></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Hidden file picker for replace -->
+    <input id="file-replace" type="file" accept=".csv,.pdf,text/csv,application/pdf" style="display: none;" />
+  </div>
+
+  <script src="lib/pdf.min.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
