@@ -68,7 +68,7 @@ Upload a CSV with these columns:
 
 ```csv
 Company,Founder / CEO,LinkedIn URL,Role
-IBM,Alison Nguyen,https://www.linkedin.com/in/alison-nguyen-549772295/,Founder
+TheOperatingCompany,Joshua Schiller,https://www.linkedin.com/in/joshschiller/,Founder
 ```
 
 The app also accepts common header variants like:
