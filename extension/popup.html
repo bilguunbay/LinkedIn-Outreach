@@ -305,6 +305,32 @@
       color: #991b1b;
       border: 1px solid #fca5a5;
     }
+    .halt-banner {
+      padding: 10px 12px;
+      background: #fef2f2;
+      color: #7f1d1d;
+      border: 1px solid #fca5a5;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.5;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .halt-banner strong { color: #991b1b; }
+    .reset-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      background: #991b1b;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .reset-btn:hover { background: #7f1d1d; }
   </style>
 </head>
 <body>
@@ -401,6 +427,10 @@
         <pre id="preview-body" class="preview-body"></pre>
 
         <div class="send-section">
+          <div id="halt-banner" class="halt-banner" style="display: none;">
+            <strong>⛔ Halted.</strong> <span id="halt-reason"></span>
+            <button id="reset-halt-btn" class="reset-btn" type="button">Reset</button>
+          </div>
           <button id="send-btn" class="send-btn" disabled>Send</button>
           <div id="send-status" class="send-status"></div>
         </div>

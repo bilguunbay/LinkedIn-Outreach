@@ -3,8 +3,11 @@
   "name": "LinkedIn Outreach",
   "version": "0.4.0",
   "description": "Personalized LinkedIn outreach for people you know.",
-  "permissions": ["storage", "tabs", "scripting"],
+  "permissions": ["storage", "tabs", "scripting", "notifications", "debugger"],
   "host_permissions": ["https://*.linkedin.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "LinkedIn Outreach",
