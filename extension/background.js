@@ -1,7 +1,6 @@
 // Background service worker — runs the LinkedIn send flow so it survives
-// the popup closing. Popup talks to us via chrome.runtime.sendMessage and
-// can listen for progress updates. We also persist the final result and
-// fire a notification so the user gets feedback even with the popup gone.
+// the popup closing. LinkedIn DOM inspection happens through injected scripts;
+// real clicks and typing happen through chrome.debugger/CDP input commands.
 
 const LAST_SEND_KEY            = 'last_send_result';
 const CONSECUTIVE_FAILURES_KEY = 'consecutive_failures';
@@ -9,11 +8,9 @@ const HALTED_KEY               = 'halted';
 const SEND_LOCK_KEY            = 'send_in_progress';
 
 const MAX_CONSECUTIVE_FAILURES = 3;
-const SEND_HARD_TIMEOUT_MS     = 30_000;
-
-// ────────────────────────────────────────────────────────────
-// Message dispatch
-// ────────────────────────────────────────────────────────────
+const SEND_HARD_TIMEOUT_MS     = 120_000;
+const SEND_TIMEOUT_PER_CHAR_MS = 180;
+const DEBUGGER_PROTOCOL        = '1.3';
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'send_to_contact') {
@@ -23,7 +20,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         console.error('[background] handleSend threw:', err);
         sendResponse({ ok: false, reason: 'Background error: ' + (err?.message || String(err)) });
       });
-    return true; // keep channel open for async sendResponse
+    return true;
   }
 
   if (msg?.type === 'reset_halt') {
@@ -38,10 +35,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 async function handleSend({ url, message, contactName }) {
   const progress = (text, kind = 'pending') => {
-    try { chrome.runtime.sendMessage({ type: 'send_progress', text, kind }); } catch (_) {}
+    try {
+      const pending = chrome.runtime.sendMessage({ type: 'send_progress', text, kind });
+      if (pending?.catch) pending.catch(() => {});
+    } catch (_) {}
   };
 
-  // ── Pre-checks: halt + concurrency lock ───────────────────
   const state = await chrome.storage.local.get([HALTED_KEY, SEND_LOCK_KEY, CONSECUTIVE_FAILURES_KEY]);
 
   if (state[HALTED_KEY]) {
@@ -53,25 +52,20 @@ async function handleSend({ url, message, contactName }) {
   }
 
   if (state[SEND_LOCK_KEY]) {
-    return {
-      ok: false,
-      reason: 'Another send is already in progress. Wait for it to finish.',
-    };
+    return { ok: false, reason: 'Another send is already in progress. Wait for it to finish.' };
   }
 
-  // Acquire lock
   await chrome.storage.local.set({ [SEND_LOCK_KEY]: true });
 
   console.log('[background] send start', { url, contactName, messageLen: message.length });
-  let tabId = null;
   let final;
+  const hardTimeoutMs = Math.max(SEND_HARD_TIMEOUT_MS, 30_000 + message.length * SEND_TIMEOUT_PER_CHAR_MS);
 
-  // ── The actual send, wrapped in a hard 30s timeout ────────
   try {
     final = await Promise.race([
-      doSend(),
+      doSend({ url, message, progress }),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Timed out after ${SEND_HARD_TIMEOUT_MS / 1000}s`)), SEND_HARD_TIMEOUT_MS)
+        setTimeout(() => reject(new Error(`Timed out after ${Math.round(hardTimeoutMs / 1000)}s`)), hardTimeoutMs)
       ),
     ]);
   } catch (err) {
@@ -79,31 +73,13 @@ async function handleSend({ url, message, contactName }) {
     final = { ok: false, reason: err?.message || String(err) };
   }
 
-  async function doSend() {
-    progress('Opening LinkedIn tab…');
-    const tab = await chrome.tabs.create({ url, active: true });
-    tabId = tab.id;
-
-    progress('Waiting for LinkedIn to load…');
-    await waitForTabComplete(tabId);
-    await sleep(2000); // let lazy-loaded UI settle (longer now that tab is active)
-
-    progress('Sending message…');
-
-    const [{ result } = {}] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: sendOnLinkedIn,
-      args: [message],
-    });
-
-    return result || { ok: false, reason: 'No result returned from injected script (page may have crashed)' };
-  }
-
-  // ── Update consecutive-failure counter ────────────────────
   let halt = null;
   let newFailureCount = state[CONSECUTIVE_FAILURES_KEY] || 0;
+  const isSkip = !!final.skip_reason;
 
   if (final.ok) {
+    newFailureCount = 0;
+  } else if (isSkip) {
     newFailureCount = 0;
   } else {
     newFailureCount += 1;
@@ -115,7 +91,6 @@ async function handleSend({ url, message, contactName }) {
     }
   }
 
-  // ── Persist everything atomically ─────────────────────────
   await chrome.storage.local.set({
     [LAST_SEND_KEY]: { ...final, contactName, url, when: new Date().toISOString() },
     [CONSECUTIVE_FAILURES_KEY]: newFailureCount,
@@ -123,9 +98,8 @@ async function handleSend({ url, message, contactName }) {
     [SEND_LOCK_KEY]: false,
   });
 
-  // ── Fire OS notification ──────────────────────────────────
   try {
-    let title = final.ok ? 'LinkedIn message sent' : 'LinkedIn send failed';
+    let title = final.ok ? (final.drafted ? 'LinkedIn message drafted' : 'LinkedIn message sent') : (isSkip ? 'LinkedIn profile skipped' : 'LinkedIn send failed');
     let body  = `${contactName || 'Contact'}: ${final.reason || ''}`;
     if (halt) {
       title = 'LinkedIn Outreach halted';
@@ -141,12 +115,11 @@ async function handleSend({ url, message, contactName }) {
     console.warn('[background] notifications.create failed:', e);
   }
 
-  // ── Best-effort live progress to popup if still open ──────
   if (halt) {
-    progress('⛔ Halted — ' + halt.reason + '. Reset in popup to continue.', 'err');
+    progress('Halted - ' + halt.reason + '. Reset in popup to continue.', 'err');
   } else {
     progress(
-      (final.ok ? '✓ ' : '✗ ') + (final.reason || 'Done') +
+      (final.ok ? 'OK: ' : 'Failed: ') + (final.reason || 'Done') +
         (newFailureCount > 0 && !final.ok ? ` (${newFailureCount}/${MAX_CONSECUTIVE_FAILURES} failures)` : ''),
       final.ok ? 'ok' : 'err'
     );
@@ -156,7 +129,117 @@ async function handleSend({ url, message, contactName }) {
   return { ...final, halted: !!halt };
 }
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function doSend({ url, message, progress }) {
+  let tabId = null;
+  let debuggerAttached = false;
+
+  progress('Opening LinkedIn tab...');
+  const tab = await chrome.tabs.create({ url, active: true });
+  tabId = tab.id;
+  try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) {}
+
+  progress('Waiting for LinkedIn to load...');
+  await waitForTabComplete(tabId);
+  await sleep(2200);
+
+  try {
+    progress('Inspecting profile...');
+    const profile = await runInjected(tabId, inspectLinkedInProfile);
+    if (!profile?.ok) return normalizeInspectionFailure(profile);
+    if (profile.state !== 'messageable') return normalizeInspectionFailure(profile);
+    await tabLog(tabId, 'inspect result', {
+      label: profile.messageButtonLabel,
+      rect: roundedRect(profile.messageButtonRect),
+    });
+
+    progress('Open LinkedIn Message manually. Waiting for composer...');
+    logDebugger('manual draft mode: waiting for composer', { tabId, timeoutMs: 60_000 });
+    await tabLog(tabId, 'manual draft mode: waiting for composer');
+    let input = await pollInjected(tabId, findMessageInput, 60_000, 500);
+    if (!input?.ok) {
+      const composerDiagnostics = await runInjected(tabId, inspectMessageDialogState, [profile.messageButtonRect]);
+      logDebugger('manual composer not detected', composerDiagnostics);
+      await tabLog(tabId, 'manual composer not detected', composerDiagnostics);
+      return {
+        ok: false,
+        reason: 'No LinkedIn message composer detected after 60 seconds. Open the Message box manually in the LinkedIn tab, then try drafting again.',
+      };
+    }
+    logDebugger('input found', input.inputRect);
+    await tabLog(tabId, 'input found after manual composer open', roundedRect(input.inputRect));
+
+    progress('Drafting message...');
+    const directDraft = await runInjected(tabId, draftMessageIntoComposer, [message]);
+    logDebugger('direct draft result', directDraft);
+    await tabLog(tabId, 'direct draft result', directDraft);
+
+    if (!directDraft?.ok) {
+      await attachDebugger(tabId);
+      debuggerAttached = true;
+      logDebugger('attached', { tabId });
+      try { await sendDebuggerCommand(tabId, 'Page.bringToFront'); } catch (_) {}
+      await tabLog(tabId, 'debugger attached for typing');
+
+      await tabLog(tabId, 'clicking message input via debugger', roundedRect(input.inputRect));
+      await debuggerClick(tabId, input.inputRect, 'Message input');
+      await sleep(250);
+      await tabLog(tabId, 'typing via debugger fallback', { length: message.length });
+      await debuggerType(tabId, message);
+    }
+
+    await sleep(700);
+    const typed = await runInjected(tabId, readMessageInput);
+    const expectedHead = message.trim().slice(0, 12);
+    logDebugger('typing verified', { expectedHead, actualHead: typed?.text?.slice(0, 30) });
+    await tabLog(tabId, 'typing verify', { expectedHead, actualHead: typed?.text?.slice(0, 30) });
+    if (!typed?.text?.includes(expectedHead)) {
+      return { ok: false, reason: 'Typed text did not appear in the message field - draft was not completed.' };
+    }
+
+    progress('Draft inserted. Review and send manually.', 'ok');
+    await tabLog(tabId, 'draft inserted; send left manual');
+    return { ok: true, drafted: true, reason: 'Message drafted in LinkedIn composer. Review and click Send manually.' };
+  } finally {
+    if (debuggerAttached) {
+      try {
+        await detachDebugger(tabId);
+        logDebugger('detached', { tabId });
+        await tabLog(tabId, 'debugger detached');
+      } catch (err) {
+        console.warn('[outreach-debugger] detach failed:', err);
+      }
+    }
+  }
+}
+
+function normalizeInspectionFailure(result) {
+  if (!result) return { ok: false, reason: 'No result returned from injected script.' };
+  return {
+    ok: false,
+    reason: result.reason || 'LinkedIn profile is not messageable.',
+    skip_reason: result.state,
+  };
+}
+
+function classifyMessageDialogFailure(dialogState) {
+  const text = safeJson(dialogState || {}).toLowerCase();
+  if (text.includes('premium') || text.includes('inmail') || text.includes('with premium')) {
+    return {
+      state: 'inmail_required',
+      reason: 'LinkedIn did not open a standard message composer and showed Premium/InMail messaging signals. Skipping this profile.',
+    };
+  }
+  return {
+    state: 'messaging_disabled',
+    reason: 'Debugger activation reached the Message button, but LinkedIn did not open a message composer.',
+  };
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function randomInt(min, max) {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
 
 function waitForTabComplete(tabId) {
   return new Promise((resolve) => {
@@ -175,91 +258,241 @@ function waitForTabComplete(tabId) {
       if (chrome.runtime.lastError) return;
       if (tab && tab.status === 'complete') finish();
     });
-    setTimeout(finish, 20000); // hard cap
+    setTimeout(finish, 20000);
   });
 }
 
-// ────────────────────────────────────────────────────────────
-// Function injected into the LinkedIn tab.
-// Self-contained — no closures, no outer-scope references.
-// Logs to console for debugging.
-// ────────────────────────────────────────────────────────────
+async function runInjected(tabId, func, args = []) {
+  const [{ result } = {}] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func,
+    args,
+  });
+  return result;
+}
 
-async function sendOnLinkedIn(messageText) {
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const rand  = (min, max) => sleep(min + Math.random() * (max - min));
+async function pollInjected(tabId, func, timeoutMs, intervalMs) {
+  const start = Date.now();
+  let lastResult = null;
+  while (Date.now() - start < timeoutMs) {
+    lastResult = await runInjected(tabId, func);
+    if (lastResult?.ok) return lastResult;
+    await sleep(intervalMs);
+  }
+  return lastResult || { ok: false };
+}
+
+function logDebugger(message, detail = {}) {
+  console.log('[outreach-debugger]', message, safeJson(detail));
+}
+
+function roundedRect(rect) {
+  if (!rect) return null;
+  return {
+    x: Math.round(rect.x),
+    y: Math.round(rect.y),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+  };
+}
+
+async function tabLog(tabId, message, detail = {}) {
+  try {
+    await runInjected(tabId, (m, d) => console.log('[outreach-debugger]', m, d), [message, safeJson(detail)]);
+  } catch (_) {}
+}
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function uniqueMessageOptions(profile) {
+  const options = [
+    {
+      label: profile.messageButtonLabel || '',
+      text: '',
+      rect: profile.messageButtonRect,
+      source: 'chosen',
+    },
+    ...(profile.messageButtonOptions || []),
+  ];
+  const seen = new Set();
+  const unique = [];
+
+  for (const option of options) {
+    const rect = option?.rect;
+    if (!rect || !Number.isFinite(rect.x) || !Number.isFinite(rect.y)) continue;
+    const key = [
+      Math.round(rect.x),
+      Math.round(rect.y),
+      Math.round(rect.width),
+      Math.round(rect.height),
+    ].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(option);
+  }
+
+  return unique;
+}
+
+function attachDebugger(tabId) {
+  const target = { tabId };
+  return new Promise((resolve, reject) => {
+    chrome.debugger.attach(target, DEBUGGER_PROTOCOL, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(
+          `Could not attach Chrome debugger: ${err.message}. Close DevTools or any other debugger attached to this tab, then try again.`
+        ));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function detachDebugger(tabId) {
+  const target = { tabId };
+  return new Promise((resolve, reject) => {
+    chrome.debugger.detach(target, () => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve();
+    });
+  });
+}
+
+function sendDebuggerCommand(tabId, method, params = {}) {
+  const target = { tabId };
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(target, method, params, (result) => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(`${method} failed: ${err.message}`));
+      else resolve(result);
+    });
+  });
+}
+
+async function debuggerClick(tabId, rect, label) {
+  if (!rect || !Number.isFinite(rect.x) || !Number.isFinite(rect.y)) {
+    throw new Error(`Cannot click ${label}: invalid element rectangle.`);
+  }
+
+  const x = rect.x + rect.width / 2;
+  const y = rect.y + rect.height / 2;
+  logDebugger(`click ${label}`, { x: Math.round(x), y: Math.round(y), rect });
+
+  await sendDebuggerCommand(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved',
+    x,
+    y,
+    button: 'none',
+    pointerType: 'mouse',
+  });
+  await sleep(randomInt(80, 180));
+  await sendDebuggerCommand(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed',
+    x,
+    y,
+    button: 'left',
+    buttons: 1,
+    clickCount: 1,
+    pointerType: 'mouse',
+  });
+  await sleep(randomInt(70, 160));
+  await sendDebuggerCommand(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased',
+    x,
+    y,
+    button: 'left',
+    buttons: 0,
+    clickCount: 1,
+    pointerType: 'mouse',
+  });
+}
+
+async function focusElementAtRect(tabId, rect) {
+  await runInjected(tabId, (targetRect) => {
+    const x = targetRect.x + targetRect.width / 2;
+    const y = targetRect.y + targetRect.height / 2;
+    const el = document.elementFromPoint(x, y);
+    if (el && typeof el.focus === 'function') el.focus();
+  }, [rect]);
+}
+
+async function debuggerPressKey(tabId, key) {
+  const keyMap = {
+    Enter: { windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, code: 'Enter', text: '\r' },
+    Space: { windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32, code: 'Space', text: ' ' },
+  };
+  const mapped = keyMap[key];
+  if (!mapped) throw new Error(`Unsupported key: ${key}`);
+
+  await sendDebuggerCommand(tabId, 'Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key,
+    code: mapped.code,
+    windowsVirtualKeyCode: mapped.windowsVirtualKeyCode,
+    nativeVirtualKeyCode: mapped.nativeVirtualKeyCode,
+  });
+  await sleep(randomInt(50, 120));
+  await sendDebuggerCommand(tabId, 'Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key,
+    code: mapped.code,
+    windowsVirtualKeyCode: mapped.windowsVirtualKeyCode,
+    nativeVirtualKeyCode: mapped.nativeVirtualKeyCode,
+  });
+}
+
+async function debuggerType(tabId, text) {
+  for (const ch of text) {
+    await sendDebuggerCommand(tabId, 'Input.insertText', { text: ch });
+    if (/[.!?]/.test(ch) && Math.random() < 0.7) await sleep(randomInt(200, 600));
+    else await sleep(randomInt(40, 130));
+  }
+}
+
+function inspectLinkedInProfile() {
   const log = (...args) => console.log('[outreach-cs]', ...args);
 
-  // LinkedIn is React-based. To trigger its handlers reliably we need to
-  // dispatch the full pointer+mouse event chain a real cursor would produce.
-  // `isTrusted` will still be false (no way around that without chrome.debugger),
-  // but with the full chain most modern React handlers respond correctly.
-  const realClick = (el) => {
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top  + rect.height / 2;
-    const base = {
-      bubbles: true, cancelable: true, composed: true, view: window,
-      clientX: x, clientY: y, screenX: x, screenY: y,
-      button: 0, buttons: 1,
+  const visibleRect = (el) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    return {
+      x: r.x,
+      y: r.y,
+      width: r.width,
+      height: r.height,
+      top: r.top,
+      left: r.left,
+      bottom: r.bottom,
+      right: r.right,
     };
-
-    // PointerEvent chain (modern React listens here)
-    try {
-      el.dispatchEvent(new PointerEvent('pointerover', { ...base, pointerType: 'mouse', pointerId: 1, isPrimary: true }));
-      el.dispatchEvent(new PointerEvent('pointerenter', { ...base, pointerType: 'mouse', pointerId: 1, isPrimary: true, bubbles: false }));
-      el.dispatchEvent(new PointerEvent('pointermove',  { ...base, pointerType: 'mouse', pointerId: 1, isPrimary: true }));
-      el.dispatchEvent(new PointerEvent('pointerdown',  { ...base, pointerType: 'mouse', pointerId: 1, isPrimary: true }));
-    } catch (_) {}
-
-    // MouseEvent chain (older listeners)
-    el.dispatchEvent(new MouseEvent('mouseover',  base));
-    el.dispatchEvent(new MouseEvent('mouseenter', { ...base, bubbles: false }));
-    el.dispatchEvent(new MouseEvent('mousemove',  base));
-    el.dispatchEvent(new MouseEvent('mousedown',  base));
-
-    // Focus the button
-    try { el.focus(); } catch (_) {}
-
-    // Up
-    try { el.dispatchEvent(new PointerEvent('pointerup', { ...base, pointerType: 'mouse', pointerId: 1, isPrimary: true, buttons: 0 })); } catch (_) {}
-    el.dispatchEvent(new MouseEvent('mouseup', { ...base, buttons: 0 }));
-
-    // The click
-    el.dispatchEvent(new MouseEvent('click', { ...base, buttons: 0 }));
-
-    // And a native .click() as belt-and-suspenders
-    try { el.click(); } catch (_) {}
   };
 
-  log('content script start', { url: location.href, len: messageText?.length });
-
-  // Allow LinkedIn's heavy lazy-loaded UI to render
-  await sleep(1500);
+  const scrollAndRect = (el) => {
+    try { el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }); } catch (_) {}
+    return visibleRect(el);
+  };
 
   const url = location.href;
+  log('content script inspect start', { url });
 
   if (/\/(login|checkpoint|authwall|uas\/login)/.test(url)) {
-    return { ok: false, reason: 'Not signed in to LinkedIn — please sign in and try again.' };
+    return { ok: false, state: 'session_expired', reason: 'Not signed in to LinkedIn - please sign in and try again.' };
   }
   if (/\/search\//.test(url)) {
-    return {
-      ok: false,
-      reason: 'This is a LinkedIn search page, not a profile. Use a direct URL like https://www.linkedin.com/in/<handle>/',
-    };
+    return { ok: false, state: 'profile_unreachable', reason: 'This is a LinkedIn search page, not a profile.' };
   }
 
-  // ── Identify the profile owner so we click the RIGHT Message button ──
-  // LinkedIn profile pages show Message buttons in many places — the top
-  // card (right one), "People also viewed" sidebar (wrong), the messaging
-  // panel toggle at the bottom (totally wrong), even your own profile pic
-  // dropdown in the global nav. Without the right person to compare against,
-  // we'll click the wrong button. Detect them from 3 sources, in order:
-  //   1. The profile <h1> (highest signal, but sometimes not rendered yet)
-  //   2. <title> tag (always present, format: "Name | LinkedIn")
-  //   3. URL slug parsing (last resort: /in/alison-nguyen-XXXXX/)
-  const detectProfileOwner = async () => {
+  const detectProfileOwner = () => {
     const h1Selectors = [
       'main h1.text-heading-xlarge',
       'main h1[class*="heading-xlarge"]',
@@ -270,45 +503,32 @@ async function sendOnLinkedIn(messageText) {
       'section h1',
       '[data-test-id*="profile-name"]',
     ];
-    // Retry over ~3 seconds — H1 may render lazily
-    for (let attempt = 0; attempt < 6; attempt++) {
-      for (const sel of h1Selectors) {
-        try {
-          const el = document.querySelector(sel);
-          const txt = el?.textContent?.trim();
-          if (txt && txt.length < 100) return { name: txt, source: 'h1' };
-        } catch (_) {}
-      }
-      if (attempt < 5) await sleep(500);
+    for (const sel of h1Selectors) {
+      try {
+        const txt = document.querySelector(sel)?.textContent?.trim();
+        if (txt && txt.length < 100) return { name: txt, source: 'h1' };
+      } catch (_) {}
     }
-
-    // Fallback 1: document.title — "Alison Nguyen | LinkedIn" or "Alison Nguyen - Founder | LinkedIn"
     if (document.title && document.title.includes('|')) {
-      const namepart = document.title.split('|')[0].trim();
-      const cleaned = namepart.replace(/\s*-.*$/, '').trim();
-      if (cleaned && cleaned !== 'LinkedIn' && cleaned.length < 100) {
-        return { name: cleaned, source: 'title' };
-      }
+      const cleaned = document.title.split('|')[0].trim().replace(/\s*-.*$/, '').trim();
+      if (cleaned && cleaned !== 'LinkedIn' && cleaned.length < 100) return { name: cleaned, source: 'title' };
     }
-
-    // Fallback 2: URL slug. /in/alison-nguyen-549772295/ → "Alison Nguyen"
     const m = location.pathname.match(/\/in\/([^/?#]+)/);
     if (m) {
       const parts = m[1].split('-').filter((p) => !/^\d+$/.test(p) && p);
       if (parts.length >= 2) {
-        const name = parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
-        return { name, source: 'url-slug' };
+        return { name: parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(' '), source: 'url-slug' };
       }
     }
-
     return null;
   };
 
-  const owner = await detectProfileOwner();
-  log('profile owner detected:', owner);
+  const owner = detectProfileOwner();
   const profileOwner = owner?.name || null;
+  const profileOwnerLow = (profileOwner || '').toLowerCase();
+  const profileOwnerParts = profileOwnerLow.split(/\s+/).filter((p) => p.length > 1);
+  log('profile owner detected:', owner);
 
-  // ── Find Message button (POSITION-based, since LinkedIn keeps changing classes) ──
   const isInsideFixedOrSticky = (el) => {
     let n = el.parentElement;
     while (n) {
@@ -319,363 +539,634 @@ async function sendOnLinkedIn(messageText) {
     return false;
   };
 
-  const findMessageButton = () => {
-    const visible = Array.from(document.querySelectorAll('button:not([disabled])'))
-      .filter((b) => {
-        const r = b.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      });
+  const buttons = Array.from(document.querySelectorAll('button:not([disabled])'))
+    .filter((b) => visibleRect(b));
 
-    // Build annotated candidate list with hard filters applied up front
-    const all = [];
-    for (const btn of visible) {
-      const label = (btn.getAttribute('aria-label') || '').trim();
-      const text  = (btn.textContent || '').trim();
-      const lLow  = label.toLowerCase();
+  const findInMailButton = () => buttons.find((b) => {
+    const l = (b.getAttribute('aria-label') || '').toLowerCase();
+    return l.includes('inmail') || l.includes('in-mail');
+  });
 
-      // Hard exclusions on label content
-      if (lLow.includes('inmail') || lLow.includes('in-mail')) continue;
-      if (lLow.includes('premium')) continue;       // Premium upsell promos
-      if (!/^Message\b/i.test(label) && !/^Message$/i.test(text)) continue;
+  const findPremiumMessageButton = () => buttons.find((b) => {
+    const l = (b.getAttribute('aria-label') || '').toLowerCase();
+    const t = (b.textContent || '').toLowerCase().trim();
+    return (l.includes('message') || t === 'message' || t === 'say hello') && l.includes('premium');
+  });
 
-      const rect = btn.getBoundingClientRect();
+  const findConnectButton = () => buttons.find((b) => {
+    const l = (b.getAttribute('aria-label') || '').toLowerCase();
+    const t = (b.textContent || '').toLowerCase().trim();
+    return l.startsWith('invite ') || l.includes('to connect') || t === 'connect';
+  });
 
-      // Position-based exclusions — these are robust to LinkedIn class changes
-      if (rect.y < 60) continue;                    // global nav strip at top
-      if (isInsideFixedOrSticky(btn)) continue;     // overlays / toggles / sticky bars
+  const candidates = [];
+  for (const btn of buttons) {
+    const label = (btn.getAttribute('aria-label') || '').trim();
+    const text = (btn.textContent || '').trim();
+    const labelLow = label.toLowerCase();
 
-      all.push({
-        btn, label, text,
-        x: Math.round(rect.x),
-        y: Math.round(rect.y),
-        inTopCard:    !!btn.closest('.pv-top-card, .pv-top-card-v2-ctas, .pvs-profile-actions, .pv-text-details__left-panel, [class*="profile-actions"], [class*="top-card"]'),
-        inMsgOverlay: !!btn.closest('[class*="msg-overlay"]'),
-        inGlobalNav:  !!btn.closest('.global-nav, #global-nav, [class*="global-nav"]'),
-        inAside:      !!btn.closest('aside'),
-      });
+    if (labelLow.includes('inmail') || labelLow.includes('in-mail')) continue;
+    if (labelLow.includes('premium')) continue;
+    if (!/^Message\b/i.test(label) && !/^Message$/i.test(text)) continue;
+    if (profileOwnerLow && /^message\s+\S+/i.test(label)) {
+      const target = label.replace(/^message\s+/i, '').trim().toLowerCase();
+      const targetLooksLikeOwner =
+        target.includes(profileOwnerLow) ||
+        profileOwnerLow.includes(target) ||
+        (profileOwnerParts.length > 0 && profileOwnerParts.every((part) => target.includes(part)));
+      if (!targetLooksLikeOwner) continue;
     }
 
-    // Verbose, expand-free logging so each candidate is visible in the console
-    log('Message button candidates count:', all.length);
-    all.forEach((c, i) => {
-      log(
-        `  cand[${i}]: ` + JSON.stringify({
-          label: c.label,
-          text: c.text.slice(0, 40),
-          pos: `(${c.x},${c.y})`,
-          inTopCard: c.inTopCard,
-          inMsgOverlay: c.inMsgOverlay,
-          inAside: c.inAside,
-          inGlobalNav: c.inGlobalNav,
-        })
-      );
+    const rect = visibleRect(btn);
+    if (!rect || rect.y < 60) continue;
+    if (isInsideFixedOrSticky(btn)) continue;
+
+    candidates.push({
+      btn,
+      label,
+      text,
+      rect,
+      inTopCard: !!btn.closest('.pv-top-card, .pv-top-card-v2-ctas, .pvs-profile-actions, .pv-text-details__left-panel, [class*="profile-actions"], [class*="top-card"]'),
+      inMsgOverlay: !!btn.closest('[class*="msg-overlay"]'),
+      inGlobalNav: !!btn.closest('.global-nav, #global-nav, [class*="global-nav"]'),
+      inAside: !!btn.closest('aside'),
     });
-
-    // Diagnostic: what's actually in the profile's top-card action area?
-    const topCardEl = document.querySelector('.pv-top-card, .pv-top-card-v2-ctas, .pvs-profile-actions, .pv-text-details__left-panel');
-    if (topCardEl) {
-      const topButtons = Array.from(topCardEl.querySelectorAll('button:not([disabled])'))
-        .map((b) => JSON.stringify({
-          aria: b.getAttribute('aria-label'),
-          text: b.textContent?.trim().slice(0, 40),
-        }));
-      log('Top-card buttons (all of them):', topButtons.length);
-      topButtons.forEach((s, i) => log(`  topbtn[${i}]: ` + s));
-    } else {
-      log('NO top-card element found — page selectors may be stale');
-    }
-
-    if (!all.length) return null;
-
-    // Hard exclude: messaging overlay toggle (NOT what we want) and global-nav widgets
-    let candidates = all.filter((c) => !c.inMsgOverlay && !c.inGlobalNav);
-    if (!candidates.length) {
-      log('all candidates were excluded as msg-overlay or global-nav');
-      return null;
-    }
-
-    // 1. Match by profile owner name (full match, then first name)
-    if (profileOwner) {
-      const fullLow  = profileOwner.toLowerCase();
-      const firstLow = profileOwner.split(/\s+/)[0]?.toLowerCase() || '';
-
-      const exact = candidates.find(({ label }) =>
-        label.toLowerCase() === `message ${fullLow}` ||
-        label.toLowerCase() === `message ${firstLow}`
-      );
-      if (exact) { log('matched profile owner exactly:', exact.label); return exact.btn; }
-
-      const containsFull = candidates.find(({ label }) => label.toLowerCase().includes(fullLow));
-      if (containsFull) { log('matched profile owner (contains full):', containsFull.label); return containsFull.btn; }
-    }
-
-    // 2. Prefer button inside the top-card / profile-actions area
-    const inTopCard = candidates.find((c) => c.inTopCard);
-    if (inTopCard) { log('matched by top-card location:', inTopCard.label); return inTopCard.btn; }
-
-    // 3. Prefer button NOT in an aside / sidebar widget
-    const notInAside = candidates.find((c) => !c.inAside);
-    if (notInAside) { log('matched (not in aside):', notInAside.label); return notInAside.btn; }
-
-    // 4. Last resort: shortest label (more generic = less likely to be a sidebar widget naming someone else)
-    log('falling back to shortest-label heuristic — no owner match, no top-card hit');
-    candidates.sort((a, b) => a.label.length - b.label.length);
-    return candidates[0].btn;
-  };
-
-  const findInMailButton = () => {
-    const all = document.querySelectorAll('button:not([disabled])');
-    for (const b of all) {
-      const l = (b.getAttribute('aria-label') || '').toLowerCase();
-      if (l.includes('inmail')) return b;
-    }
-    return null;
-  };
-
-  const findConnectButton = () => {
-    const all = document.querySelectorAll('button:not([disabled])');
-    for (const b of all) {
-      const l = (b.getAttribute('aria-label') || '').toLowerCase();
-      const t = (b.textContent || '').toLowerCase().trim();
-      if (l.startsWith('invite ') || l.includes('to connect') || t === 'connect') return b;
-    }
-    return null;
-  };
-
-  const messageBtn = findMessageButton();
-  log('chose messageBtn:', messageBtn?.getAttribute('aria-label') || messageBtn?.textContent?.trim());
-
-  // Safety guard: if we accidentally selected a button for the logged-in user
-  // (which appears in places like "Recently messaged"), bail out instead of
-  // clicking it. We detect "you" by reading the nav profile alt text.
-  const meAlt = (document.querySelector('.global-nav__me-photo, .global-nav img[alt]')?.getAttribute('alt') || '').trim().toLowerCase();
-  const chosenLabelLow = (messageBtn?.getAttribute('aria-label') || '').toLowerCase();
-  if (meAlt && chosenLabelLow && chosenLabelLow.includes(meAlt)) {
-    log('REFUSING to click: the chosen button is addressed to the logged-in user', { meAlt, chosenLabelLow });
-    return {
-      ok: false,
-      reason: `Could not locate a Message button for "${profileOwner || 'the profile owner'}". The only candidates on the page were addressed to you (the logged-in user). LinkedIn may have changed the profile page layout, or this contact does not have a Message button visible.`,
-    };
   }
 
-  if (!messageBtn) {
-    if (findInMailButton()) {
-      return { ok: false, reason: 'Profile only allows InMail (paid) — skipping for safety.' };
+  log('Message button candidates:', candidates.map((c) => ({
+    label: c.label,
+    text: c.text.slice(0, 40),
+    rect: { x: Math.round(c.rect.x), y: Math.round(c.rect.y), width: Math.round(c.rect.width), height: Math.round(c.rect.height) },
+    inTopCard: c.inTopCard,
+    inMsgOverlay: c.inMsgOverlay,
+    inAside: c.inAside,
+    inGlobalNav: c.inGlobalNav,
+  })));
+
+  let filtered = candidates.filter((c) => !c.inMsgOverlay && !c.inGlobalNav);
+
+  const meAltRaw = (document.querySelector('.global-nav__me-photo, .global-nav img[alt]')?.getAttribute('alt') || '').trim();
+  const meAlt = meAltRaw.toLowerCase();
+  const meName = meAlt
+    .replace(/\bview\s+profile\b/g, '')
+    .replace(/\bopen\s+profile\b/g, '')
+    .replace(/\byou\b/g, '')
+    .trim();
+  const ownNameParts = meName.split(/\s+/).filter((p) => p.length > 1);
+
+  filtered = filtered.filter((c) => {
+    const labelLow = (c.label || '').toLowerCase();
+    if (!labelLow) return true;
+    if (meName && labelLow.includes(meName)) return false;
+    if (ownNameParts.length >= 2 && ownNameParts.every((part) => labelLow.includes(part))) return false;
+    return true;
+  });
+
+  if (profileOwner && filtered.length) {
+    const fullLow = profileOwner.toLowerCase();
+    const firstLow = profileOwner.split(/\s+/)[0]?.toLowerCase() || '';
+    const exact = filtered.find(({ label }) =>
+      label.toLowerCase() === `message ${fullLow}` ||
+      label.toLowerCase() === `message ${firstLow}`
+    );
+    if (exact) filtered = [exact];
+    else {
+      const containsFull = filtered.find(({ label }) => label.toLowerCase().includes(fullLow));
+      if (containsFull) filtered = [containsFull];
     }
-    if (findConnectButton()) {
-      return { ok: false, reason: 'Not yet a 1st-degree connection. Send a connect request first, then message.' };
-    }
-    return {
-      ok: false,
-      reason: 'No Message button found on this profile. The profile may be private, the contact may have messaging disabled, or LinkedIn changed their UI.',
-    };
   }
 
-  // ── Click Message → wait for the dialog ──────────────────
-  messageBtn.scrollIntoView({ behavior: 'instant', block: 'center' });
-  await rand(300, 600);
+  const chosen =
+    filtered.find((c) => c.inTopCard) ||
+    filtered.find((c) => !c.inAside) ||
+    [...filtered].sort((a, b) => a.label.length - b.label.length)[0];
 
-  // Snapshot state before click so we can diff afterward
-  const urlBefore = location.href;
-  const editableCountBefore = document.querySelectorAll('div[contenteditable="true"]').length;
+  if (!chosen) {
+    if (findInMailButton()) return { ok: false, state: 'inmail_required', reason: 'Profile only allows InMail (paid) - skipping for safety.' };
+    if (findPremiumMessageButton()) return { ok: false, state: 'inmail_required', reason: 'Profile appears to require LinkedIn Premium/InMail messaging - skipping for safety.' };
+    if (findConnectButton()) return { ok: false, state: 'not_a_connection', reason: 'Not yet a 1st-degree connection. Send a connect request first, then message.' };
+    return { ok: false, state: 'messaging_disabled', reason: 'No Message button found on this profile.' };
+  }
 
-  // Watch for any new nodes added to the DOM after the click. This will
-  // catch the message overlay being injected even if we miss it with selectors.
-  const newClassesObserved = new Set();
-  const newNodesObserved   = [];
-  const observer = new MutationObserver((mutations) => {
-    for (const m of mutations) {
-      for (const n of m.addedNodes) {
-        if (n.nodeType !== 1) continue;
-        const cls = (n.className && typeof n.className === 'string') ? n.className : '';
-        if (cls) newClassesObserved.add(cls);
-        if (newNodesObserved.length < 10) newNodesObserved.push({ tag: n.tagName, cls: cls.slice(0, 100) });
+  const chosenLabelLow = (chosen.label || '').toLowerCase();
+  if (
+    chosenLabelLow &&
+    (
+      (meName && chosenLabelLow.includes(meName)) ||
+      (ownNameParts.length >= 2 && ownNameParts.every((part) => chosenLabelLow.includes(part)))
+    )
+  ) {
+    return { ok: false, state: 'messaging_disabled', reason: 'Refusing to click a Message button addressed to the logged-in user.' };
+  }
+
+  const rect = scrollAndRect(chosen.btn);
+  if (!rect) return { ok: false, state: 'messaging_disabled', reason: 'Message button was found but is not visible.' };
+  const messageButtonOptions = filtered
+    .map((c, index) => ({
+      label: c.label || '',
+      text: c.text || '',
+      rect: visibleRect(c.btn),
+      source: c === chosen ? 'chosen' : `candidate-${index}`,
+      inTopCard: c.inTopCard,
+      inAside: c.inAside,
+    }))
+    .filter((c) => c.rect);
+
+  log('chose messageBtn:', chosen.label || chosen.text);
+  return {
+    ok: true,
+    state: 'messageable',
+    profileOwner,
+    messageButtonLabel: chosen.label || chosen.text,
+    messageButtonRect: rect,
+    messageButtonOptions,
+  };
+}
+
+function inspectClickTarget(rect) {
+  const describe = (el) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const attrs = {};
+    for (const attr of Array.from(el.attributes || [])) {
+      if (/^(aria-|data-|id$|class$|type$|role$)/i.test(attr.name)) {
+        attrs[attr.name] = attr.value.slice(0, 180);
       }
     }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+    const ancestry = [];
+    let n = el;
+    while (n && ancestry.length < 6) {
+      ancestry.push({
+        tag: n.tagName,
+        id: n.id || '',
+        className: typeof n.className === 'string' ? n.className.slice(0, 120) : '',
+        ariaLabel: n.getAttribute?.('aria-label') || '',
+        role: n.getAttribute?.('role') || '',
+        text: (n.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100),
+      });
+      n = n.parentElement;
+    }
+    return {
+      tag: el.tagName,
+      id: el.id || '',
+      className: typeof el.className === 'string' ? el.className.slice(0, 160) : '',
+      ariaLabel: el.getAttribute('aria-label') || '',
+      role: el.getAttribute('role') || '',
+      type: el.getAttribute('type') || '',
+      attrs,
+      ancestry,
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 160),
+      rect: {
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+      },
+    };
+  };
 
-  log('clicking Message button…');
-  realClick(messageBtn);
+  if (!rect) return { ok: false, reason: 'No rect supplied.' };
+  const x = rect.x + rect.width / 2;
+  const y = rect.y + rect.height / 2;
+  const el = document.elementFromPoint(x, y);
+  const clickable = el?.closest?.('button, a, [role="button"]');
 
-  log('clicked, waiting for dialog…');
-  await rand(900, 1500);
+  return {
+    ok: true,
+    point: { x: Math.round(x), y: Math.round(y) },
+    elementAtPoint: describe(el),
+    clickableAtPoint: describe(clickable),
+    activeElement: describe(document.activeElement),
+  };
+}
 
+function installClickProbe(rect) {
+  const describe = (el) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return {
+      tag: el.tagName,
+      id: el.id || '',
+      className: typeof el.className === 'string' ? el.className.slice(0, 140) : '',
+      ariaLabel: el.getAttribute?.('aria-label') || '',
+      role: el.getAttribute?.('role') || '',
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120),
+      rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
+    };
+  };
+  const x = rect ? rect.x + rect.width / 2 : null;
+  const y = rect ? rect.y + rect.height / 2 : null;
+  const pointEl = rect ? document.elementFromPoint(x, y) : null;
+  const clickable = pointEl?.closest?.('button, a, [role="button"]') || null;
+  const state = {
+    installedAt: new Date().toISOString(),
+    point: rect ? { x: Math.round(x), y: Math.round(y) } : null,
+    originalTarget: describe(clickable || pointEl),
+    events: [],
+  };
+  const eventTypes = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown', 'keyup'];
+
+  if (window.__outreachClickProbe?.cleanup) {
+    try { window.__outreachClickProbe.cleanup(); } catch (_) {}
+  }
+
+  const listener = (event) => {
+    const target = event.target;
+    const nearest = target?.closest?.('button, a, [role="button"]') || target;
+    state.events.push({
+      type: event.type,
+      isTrusted: event.isTrusted,
+      defaultPrevented: event.defaultPrevented,
+      eventPhase: event.eventPhase,
+      button: event.button,
+      buttons: event.buttons,
+      key: event.key,
+      code: event.code,
+      clientX: Number.isFinite(event.clientX) ? Math.round(event.clientX) : null,
+      clientY: Number.isFinite(event.clientY) ? Math.round(event.clientY) : null,
+      target: describe(target),
+      nearestClickable: describe(nearest),
+      activeElement: describe(document.activeElement),
+    });
+    if (state.events.length > 30) state.events.shift();
+  };
+
+  for (const type of eventTypes) document.addEventListener(type, listener, true);
+  window.__outreachClickProbe = {
+    state,
+    cleanup() {
+      for (const type of eventTypes) document.removeEventListener(type, listener, true);
+    },
+  };
+
+  return { ok: true, installedAt: state.installedAt, originalTarget: state.originalTarget, point: state.point };
+}
+
+function readClickProbe() {
+  const probe = window.__outreachClickProbe;
+  if (!probe) return { ok: false, reason: 'Click probe was not installed.' };
+  try { probe.cleanup(); } catch (_) {}
+  const state = probe.state;
+  window.__outreachClickProbe = null;
+  return { ok: true, ...state };
+}
+
+function inspectMessageDialogState(rect) {
+  const describe = (el) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return {
+      tag: el.tagName,
+      id: el.id || '',
+      className: typeof el.className === 'string' ? el.className.slice(0, 160) : '',
+      ariaLabel: el.getAttribute('aria-label') || '',
+      role: el.getAttribute('role') || '',
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 160),
+      rect: {
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+      },
+    };
+  };
+  const x = rect ? rect.x + rect.width / 2 : 0;
+  const y = rect ? rect.y + rect.height / 2 : 0;
+  const pointEl = rect ? document.elementFromPoint(x, y) : null;
+  const clickTarget = {
+    ok: !!rect,
+    point: rect ? { x: Math.round(x), y: Math.round(y) } : null,
+    elementAtPoint: describe(pointEl),
+    clickableAtPoint: describe(pointEl?.closest?.('button, a, [role="button"]')),
+    activeElement: describe(document.activeElement),
+  };
+  const editableNodes = Array.from(document.querySelectorAll('div[contenteditable="true"], [role="textbox"]'));
+  const dialogNodes = Array.from(document.querySelectorAll('[role="dialog"], [class*="msg-overlay"], [class*="msg-form"], [class*="msg-conversation"]'));
+  const buttons = Array.from(document.querySelectorAll('button')).slice(0, 250);
+  const messageLikeButtons = buttons
+    .map((b) => ({
+      ariaLabel: (b.getAttribute('aria-label') || '').trim(),
+      text: (b.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+      disabled: !!b.disabled || b.getAttribute('aria-disabled') === 'true',
+      rect: (() => {
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+      })(),
+    }))
+    .filter((b) => /message|send/i.test(`${b.ariaLabel} ${b.text}`))
+    .slice(0, 12);
+
+  return {
+    ok: true,
+    url: location.href,
+    clickTarget,
+    activeTag: document.activeElement?.tagName || '',
+    activeText: (document.activeElement?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120),
+    contenteditableCount: editableNodes.length,
+    contenteditables: editableNodes.slice(0, 6).map((el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        tag: el.tagName,
+        ariaLabel: el.getAttribute('aria-label') || '',
+        role: el.getAttribute('role') || '',
+        className: typeof el.className === 'string' ? el.className.slice(0, 120) : '',
+        text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+        rect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
+      };
+    }),
+    msgElementCount: document.querySelectorAll('[class*="msg-"]').length,
+    dialogLikeCount: dialogNodes.length,
+    dialogLikeSamples: dialogNodes.slice(0, 6).map((el) => ({
+      tag: el.tagName,
+      role: el.getAttribute('role') || '',
+      className: typeof el.className === 'string' ? el.className.slice(0, 140) : '',
+      text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120),
+    })),
+    messageLikeButtons,
+  };
+}
+
+function findMessageInput() {
+  const log = (...args) => console.log('[outreach-cs]', ...args);
+  const visibleRect = (el) => {
+    const rect = el?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+      top: rect.top,
+      left: rect.left,
+      bottom: rect.bottom,
+      right: rect.right,
+    };
+  };
+  const describeInput = (el, selector) => {
+    const rect = visibleRect(el);
+    if (!el || !rect) return null;
+    return {
+      ok: true,
+      selector,
+      text: (el.innerText || el.textContent || '').trim(),
+      inputRect: rect,
+    };
+  };
+  const selectors = [
+    '.msg-form__contenteditable[contenteditable="true"]',
+    '.msg-form__msg-content-container div[contenteditable="true"]',
+    '.msg-form div[contenteditable="true"]',
+    '.msg-overlay-conversation-bubble div[contenteditable="true"]',
+    '.msg-overlay-base-conversation-bubble div[contenteditable="true"]',
+    'form div[contenteditable="true"][role="textbox"]',
+    'div[contenteditable="true"][role="textbox"]',
+    'div[role="textbox"][aria-label*="message" i]',
+    'div[contenteditable="true"][aria-label*="message" i]',
+    '[role="dialog"] div[contenteditable="true"]',
+    '[class*="msg-"] div[contenteditable="true"]',
+  ];
+
+  for (const selector of selectors) {
+    try {
+      const el = document.querySelector(selector);
+      const found = describeInput(el, selector);
+      if (found) {
+        log('message input found:', selector);
+        return found;
+      }
+    } catch (_) {}
+  }
+
+  const genericEditables = Array.from(document.querySelectorAll('div[contenteditable="true"], [role="textbox"]'))
+    .map((el) => ({ el, rect: visibleRect(el) }))
+    .filter(({ rect }) => rect && rect.y > 50);
+  const likely = genericEditables.find(({ el }) =>
+    !!el.closest('[role="dialog"], form, [class*="msg"], [class*="message"], [class*="compose"]')
+  ) || (genericEditables.length === 1 ? genericEditables[0] : null);
+
+  if (likely) {
+    log('message input found by generic visible editable fallback');
+    return describeInput(likely.el, 'generic visible editable fallback');
+  }
+
+  return {
+    ok: false,
+    reason: 'Message input not found.',
+    diagnostics: {
+      contenteditableCount: genericEditables.length,
+      msgElementCount: document.querySelectorAll('[class*="msg-"]').length,
+      editableSamples: genericEditables.slice(0, 8).map(({ el, rect }) => ({
+        tag: el.tagName,
+        role: el.getAttribute('role') || '',
+        ariaLabel: el.getAttribute('aria-label') || '',
+        className: typeof el.className === 'string' ? el.className.slice(0, 120) : '',
+        text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+        rect: {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        },
+      })),
+    },
+  };
+}
+
+function readMessageInput() {
+  const visibleRect = (el) => {
+    const rect = el?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return rect;
+  };
+  const selectors = [
+    '.msg-form__contenteditable[contenteditable="true"]',
+    '.msg-form__msg-content-container div[contenteditable="true"]',
+    '.msg-form div[contenteditable="true"]',
+    '.msg-overlay-conversation-bubble div[contenteditable="true"]',
+    '.msg-overlay-base-conversation-bubble div[contenteditable="true"]',
+    'form div[contenteditable="true"][role="textbox"]',
+    'div[contenteditable="true"][role="textbox"]',
+    'div[role="textbox"][aria-label*="message" i]',
+    'div[contenteditable="true"][aria-label*="message" i]',
+    '[role="dialog"] div[contenteditable="true"]',
+    '[class*="msg-"] div[contenteditable="true"]',
+  ];
+  for (const selector of selectors) {
+    const el = document.querySelector(selector);
+    if (el && visibleRect(el)) return { ok: true, text: (el.innerText || el.textContent || '').trim(), selector };
+  }
+  const editables = Array.from(document.querySelectorAll('div[contenteditable="true"], [role="textbox"]'))
+    .filter((el) => visibleRect(el));
+  const el = editables.find((node) =>
+    !!node.closest('[role="dialog"], form, [class*="msg"], [class*="message"], [class*="compose"]')
+  ) || (editables.length === 1 ? editables[0] : null);
+  if (!el) return { ok: false, reason: 'Message input not found.' };
+  return { ok: true, text: (el.innerText || el.textContent || '').trim(), selector: 'generic visible editable fallback' };
+}
+
+function draftMessageIntoComposer(message) {
+  const visibleRect = (el) => {
+    const rect = el?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return rect;
+  };
   const findInput = () => {
-    const cands = [
-      // Inline message overlay (bottom-right floating dialog)
+    const selectors = [
       '.msg-form__contenteditable[contenteditable="true"]',
       '.msg-form__msg-content-container div[contenteditable="true"]',
       '.msg-form div[contenteditable="true"]',
-      // Full /messaging/thread page
       '.msg-overlay-conversation-bubble div[contenteditable="true"]',
       '.msg-overlay-base-conversation-bubble div[contenteditable="true"]',
-      // Semantic
+      'form div[contenteditable="true"][role="textbox"]',
+      'div[contenteditable="true"][role="textbox"]',
       'div[role="textbox"][aria-label*="message" i]',
       'div[contenteditable="true"][aria-label*="message" i]',
-      // Last resort: any contenteditable inside any msg- element
+      '[role="dialog"] div[contenteditable="true"]',
       '[class*="msg-"] div[contenteditable="true"]',
     ];
-    for (const s of cands) {
-      try { const el = document.querySelector(s); if (el && el.offsetParent !== null) return el; } catch (_) {}
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (el && visibleRect(el)) return { el, selector };
     }
-    return null;
+    const editables = Array.from(document.querySelectorAll('div[contenteditable="true"], [role="textbox"]'))
+      .filter((el) => visibleRect(el));
+    const el = editables.find((node) =>
+      !!node.closest('[role="dialog"], form, [class*="msg"], [class*="message"], [class*="compose"]')
+    ) || (editables.length === 1 ? editables[0] : null);
+    return el ? { el, selector: 'generic visible editable fallback' } : null;
   };
 
-  // Wait up to ~12 seconds for the dialog
-  let input = null;
-  for (let i = 0; i < 30 && !input; i++) {
-    input = findInput();
-    if (!input) await sleep(400);
-  }
+  const found = findInput();
+  if (!found) return { ok: false, reason: 'Message composer input not found.' };
 
-  observer.disconnect();
+  const { el, selector } = found;
+  const head = message.trim().slice(0, 12);
+  try { el.focus(); } catch (_) {}
 
-  if (!input) {
-    // Comprehensive diagnostic: tell us what happened after the click.
-    const urlAfter = location.href;
-    const allEditable = Array.from(document.querySelectorAll('div[contenteditable="true"]'));
-    const msgEls      = document.querySelectorAll('[class*="msg-"]');
-
-    log('====== DIAGNOSTIC: input not found ======');
-    log('URL before click:', urlBefore);
-    log('URL after click: ', urlAfter);
-    log('URL changed?    :', urlBefore !== urlAfter);
-    log('contenteditable count BEFORE click:', editableCountBefore);
-    log('contenteditable count AFTER click :', allEditable.length);
-    log('msg-* element count               :', msgEls.length);
-    log('DOM nodes added after click       :', newNodesObserved.length);
-    newNodesObserved.forEach((n, i) => log(`  added node [${i}]`, n));
-    log('unique classes on added nodes     :', Array.from(newClassesObserved).slice(0, 20));
-
-    // Build a useful one-line reason
-    let reason;
-    if (urlBefore !== urlAfter) {
-      reason = `Click navigated to a new URL (${urlAfter.replace(/^https?:\/\/[^/]+/, '')}). LinkedIn opened messaging on a different page — our injected script doesn't follow navigations. We'll need to handle this differently.`;
-    } else if (newNodesObserved.length === 0) {
-      reason = `Click did not trigger any DOM change. LinkedIn's React handler likely ignored the synthetic click (isTrusted: false). Real-cursor clicks via chrome.debugger are the next step.`;
-    } else {
-      reason = `Click triggered DOM changes but no message dialog appeared. ${newNodesObserved.length} new nodes were added but none matched expected dialog selectors. Check the LinkedIn tab DevTools console for the DIAGNOSTIC dump.`;
-    }
-
-    return { ok: false, reason };
-  }
-
-  log('found input:', input.className);
-
-  // ── Type the message ──────────────────────────────────────
-  // Focus + place caret at end of any existing content so we don't overwrite.
-  input.focus();
   try {
+    const selection = window.getSelection();
     const range = document.createRange();
-    range.selectNodeContents(input);
+    range.selectNodeContents(el);
+    range.deleteContents();
     range.collapse(false);
-    const sel = window.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
+    selection.removeAllRanges();
+    selection.addRange(range);
   } catch (_) {}
-  await sleep(250);
 
-  for (const ch of messageText) {
-    document.execCommand('insertText', false, ch);
-    // After each character, fire an input event so React's onChange picks it up.
-    // (execCommand SHOULD fire one, but in some Chrome versions React misses it.)
-    try {
-      input.dispatchEvent(new InputEvent('input', {
-        bubbles: true, cancelable: true, inputType: 'insertText', data: ch, composed: true,
-      }));
-    } catch (_) {}
-    if (/[.!?]/.test(ch) && Math.random() < 0.7) await rand(200, 600);
-    else await rand(40, 130);
-  }
-
-  // Longer pause after typing so React state has time to settle before we
-  // ask Send to consume it.
-  await rand(900, 1400);
-
-  // Final "the user is done typing" nudge.
+  let insertedWithCommand = false;
   try {
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, composed: true }));
-    input.dispatchEvent(new Event('change',     { bubbles: true }));
-    input.dispatchEvent(new Event('blur',       { bubbles: true }));
-    input.focus();
+    insertedWithCommand = document.execCommand('insertText', false, message);
   } catch (_) {}
 
-  // ── Verify text actually landed in the DOM ───────────────
-  const entered = (input.innerText || input.textContent || '').trim();
-  const head = messageText.trim().slice(0, 12);
-  log('verify typed text:', { enteredHead: entered.slice(0, 30), expectedHead: head });
-  if (!entered.includes(head)) {
-    return { ok: false, reason: 'Typed text did not appear in the message field — aborting before send.' };
+  let text = (el.innerText || el.textContent || '').trim();
+  if (!text.includes(head)) {
+    el.textContent = message;
+    try {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch (_) {}
   }
 
-  // ── Find + click Send ────────────────────────────────────
-  await rand(500, 900);
+  try {
+    el.dispatchEvent(new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      inputType: 'insertText',
+      data: message,
+    }));
+  } catch (_) {}
+  try {
+    el.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      inputType: 'insertText',
+      data: message,
+    }));
+  } catch (_) {
+    try { el.dispatchEvent(new Event('input', { bubbles: true, composed: true })); } catch (__) {}
+  }
+  try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
 
-  const findSendButton = () => {
-    const cands = [
-      '.msg-form__send-button',
-      '.msg-form__right-actions button',
-      'button.msg-form__send-btn',
-      'button[type="submit"][class*="send" i]',
-    ];
-    for (const s of cands) {
-      try { const el = document.querySelector(s); if (el && !el.disabled) return el; } catch (_) {}
+  text = (el.innerText || el.textContent || '').trim();
+  return {
+    ok: text.includes(head),
+    selector,
+    insertedWithCommand,
+    actualHead: text.slice(0, 30),
+    expectedHead: head,
+    reason: text.includes(head) ? 'Draft inserted directly.' : 'Direct insertion did not update composer text.',
+  };
+}
+
+function findSendButton() {
+  const selectors = [
+    '.msg-form__send-button',
+    '.msg-form__right-actions button',
+    'button.msg-form__send-btn',
+    'button[type="submit"][class*="send" i]',
+  ];
+
+  const rectFor = (el) => {
+    const rect = el?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+      top: rect.top,
+      left: rect.left,
+      bottom: rect.bottom,
+      right: rect.right,
+    };
+  };
+
+  const consider = (el, selector) => {
+    const rect = rectFor(el);
+    if (!el || !rect) return null;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, reason: 'Send button is still disabled.' };
     }
-    // Fallback by aria-label / text inside the form
-    const formButtons = document.querySelectorAll('.msg-form button:not([disabled])');
-    for (const b of formButtons) {
-      const lbl = (b.getAttribute('aria-label') || '').trim();
-      const txt = (b.textContent || '').trim();
-      if (/^Send\b/i.test(lbl) || /^Send$/i.test(txt)) return b;
+    return { ok: true, selector, sendButtonRect: rect };
+  };
+
+  for (const selector of selectors) {
+    try {
+      const result = consider(document.querySelector(selector), selector);
+      if (result?.ok) return result;
+    } catch (_) {}
+  }
+
+  const formButtons = document.querySelectorAll('.msg-form button');
+  for (const b of formButtons) {
+    const lbl = (b.getAttribute('aria-label') || '').trim();
+    const txt = (b.textContent || '').trim();
+    if (/^Send\b/i.test(lbl) || /^Send$/i.test(txt)) {
+      const result = consider(b, 'form button label');
+      if (result?.ok) return result;
+      return result;
     }
-    // Last-ditch broader scan inside any msg- overlay
-    const overlay = document.querySelector('[class*="msg-overlay"], [class*="msg-form"]');
-    if (overlay) {
-      const all = overlay.querySelectorAll('button:not([disabled])');
-      for (const b of all) {
-        const lbl = (b.getAttribute('aria-label') || '').toLowerCase();
-        const txt = (b.textContent || '').toLowerCase().trim();
-        if (lbl === 'send' || txt === 'send') return b;
+  }
+
+  const overlay = document.querySelector('[class*="msg-overlay"], [class*="msg-form"]');
+  if (overlay) {
+    const all = overlay.querySelectorAll('button');
+    for (const b of all) {
+      const lbl = (b.getAttribute('aria-label') || '').toLowerCase();
+      const txt = (b.textContent || '').toLowerCase().trim();
+      if (lbl === 'send' || txt === 'send') {
+        const result = consider(b, 'msg overlay send button');
+        if (result?.ok) return result;
+        return result;
       }
     }
-    return null;
-  };
-
-  let sendButton = findSendButton();
-  log('sendButton initial:', sendButton, sendButton && { disabled: sendButton.disabled, aria: sendButton.getAttribute('aria-label') });
-
-  // Send button is often disabled until React state catches up with our text.
-  // Wait up to ~5s for it to become enabled.
-  for (let i = 0; i < 12 && (!sendButton || sendButton.disabled); i++) {
-    await sleep(400);
-    sendButton = findSendButton();
   }
 
-  if (!sendButton) {
-    return { ok: false, reason: 'Send button not found. Message was typed but not sent.' };
-  }
-  if (sendButton.disabled) {
-    return { ok: false, reason: 'Send button stayed disabled after typing — LinkedIn likely did not register the typed message in its React state. Send not attempted.' };
-  }
-
-  log('clicking Send…');
-  realClick(sendButton);
-
-  // ── Verify the send actually happened ────────────────────
-  // LinkedIn clears the message input after a successful send. If our text
-  // is still in the input 2s after clicking Send, the send didn't go through.
-  await sleep(2000);
-  const stillThere = (input.innerText || input.textContent || '').trim();
-  const messageGone = !stillThere || !stillThere.includes(head);
-  log('post-send input state:', { remainingHead: stillThere.slice(0, 30), messageGone });
-
-  if (!messageGone) {
-    return {
-      ok: false,
-      reason: 'Send was clicked but the message stayed in the input — LinkedIn did not actually send it. Likely a synthetic-click rejection (isTrusted) or a hidden validation block.',
-    };
-  }
-
-  return { ok: true, reason: 'Message sent.' };
+  return { ok: false, reason: 'Send button not found.' };
 }

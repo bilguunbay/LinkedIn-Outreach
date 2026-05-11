@@ -12,6 +12,7 @@ const ROW_HARD_CAP           = 200;
 const MESSAGE_CHAR_LIMIT     = 1900;
 const MESSAGE_CHAR_WARNING   = 1700;
 const SAVE_DEBOUNCE_MS       = 250;
+const DEBUGGER_ACK_KEY       = 'debugger_send_acknowledged';
 
 const DEFAULT_TEMPLATE_BODY =
 `Hi {{name}},
@@ -1044,6 +1045,16 @@ sendBtn.addEventListener('click', async () => {
   const message = fillTemplate(templateBody.value, firstContact);
   if (!message.trim()) return;
 
+  const debuggerAck = await getStored(DEBUGGER_ACK_KEY);
+  if (!debuggerAck) {
+    const ok = confirm(
+      'This send path uses Chrome debugger automation to click and type in LinkedIn. ' +
+      'Chrome may show a debugging warning, and LinkedIn automation may violate LinkedIn terms. Continue?'
+    );
+    if (!ok) return;
+    await setStored(DEBUGGER_ACK_KEY, true);
+  }
+
   sendBtn.disabled = true;
   showSendStatus('Sending…', 'pending');
 
@@ -1058,7 +1069,7 @@ sendBtn.addEventListener('click', async () => {
     });
 
     if (response?.ok) {
-      showSendStatus('✓ ' + (response.reason || 'Message sent'), 'ok');
+      showSendStatus('✓ ' + (response.reason || 'Done'), 'ok');
     } else if (response) {
       showSendStatus('✗ ' + (response.reason || 'Send failed'), 'err');
     }
@@ -1132,4 +1143,3 @@ function showSendStatus(text, kind) {
   sendStatusEl.textContent = text;
   sendStatusEl.className = 'send-status show ' + kind;
 }
-
