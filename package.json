@@ -4,10 +4,11 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
+    "dev": "node server.js",
     "draft:linkedin": "node scripts/playwright-draft.js",
     "send:linkedin": "node scripts/playwright-draft.js --send",
     "status:linkedin": "node scripts/playwright-draft.js --status",
-    "check": "node --check scripts/playwright-draft.js && node --check extension/background.js && node --check extension/popup.js"
+    "check": "node --check server.js && node --check web/app.js && node --check scripts/playwright-draft.js && node --check extension/background.js && node --check extension/popup.js"
   },
   "devDependencies": {
     "playwright": "^1.56.0"

@@ -48,6 +48,7 @@ async function main() {
   const message = readMessage(args);
   const userDataDir = path.resolve(args.profile || process.env.LINKEDIN_PLAYWRIGHT_PROFILE || '.playwright-linkedin-profile');
   const shouldSend = args.send === true || process.env.LINKEDIN_OUTREACH_SEND === '1';
+  const shouldClose = args.close === true || process.env.LINKEDIN_OUTREACH_CLOSE === '1';
   const safety = buildSafetyOptions(args);
   let sendLock = null;
   let sendRecorded = false;
@@ -97,6 +98,9 @@ async function main() {
     await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => {});
 
     if (await isLoginOrCheckpoint(page)) {
+      if (shouldClose) {
+        throw new Error('LinkedIn wants login/checkpoint. Run npm run draft:linkedin manually once, complete login in the Playwright browser, then retry from the UI.');
+      }
       console.log('[playwright-draft] LinkedIn wants login/checkpoint. Log in in the opened browser, then press Enter here.');
       await waitForEnter();
       await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
@@ -114,6 +118,8 @@ async function main() {
     const ownerName = await detectProfileOwner(page);
     console.log('[playwright-draft] profile owner:', ownerName || '(unknown)');
 
+    await dismissOpenMessagingOverlays(page);
+
     const messageButton = await findProfileMessageButton(page, ownerName);
     if (!messageButton) {
       await logMessageButtonDiagnostics(page);
@@ -125,13 +131,13 @@ async function main() {
     await humanPause(250, 600);
     await messageButton.click({ delay: randomInt(40, 120) });
 
-    const composer = await waitForComposer(page, 15_000);
+    const composer = await waitForComposer(page, 15_000, ownerName);
     if (!composer) {
       await logComposerDiagnostics(page);
-      throw new Error('Message button clicked, but LinkedIn composer did not appear.');
+      throw new Error(`Message button clicked, but no composer for ${ownerName || 'the profile'} appeared.`);
     }
 
-    console.log('[playwright-draft] composer found; drafting message');
+    console.log('[playwright-draft] composer found for profile; drafting message');
     await composer.click({ delay: randomInt(40, 120) });
     await clearComposer(page, composer);
     await humanPause(200, 400);
@@ -147,7 +153,7 @@ async function main() {
     console.log('[playwright-draft] draft inserted and verified');
 
     if (shouldSend) {
-      const sendButton = await waitForSendButton(page, 8_000);
+      const sendButton = await waitForSendButton(page, composer, 8_000);
       if (!sendButton) throw new Error('Send requested, but no enabled Send button was found.');
       await assertNoLinkedInWarning(page, 'before send');
       await applyPreSendDelay(safety);
@@ -182,7 +188,12 @@ async function main() {
     throw err;
   } finally {
     if (sendLock) releaseSendLock(sendLock);
-    console.log('[playwright-draft] leaving browser open for inspection. Press Ctrl+C in this terminal when done.');
+    if (shouldClose) {
+      await context.close();
+      console.log('[playwright-draft] browser closed');
+    } else {
+      console.log('[playwright-draft] leaving browser open for inspection. Press Ctrl+C in this terminal when done.');
+    }
   }
 }
 
@@ -354,9 +365,45 @@ function acquireSendLock() {
     return fd;
   } catch (err) {
     if (err.code === 'EEXIST') {
+      const staleReason = getStaleLockReason();
+      if (staleReason) {
+        console.warn(`[playwright-draft] removing stale send lock: ${staleReason}`);
+        try { fs.unlinkSync(LOCK_PATH); } catch (_) {}
+        return acquireSendLock();
+      }
       throw new Error(`Another send appears to be running (${LOCK_PATH}). Remove the lock only if you are sure it is stale.`);
     }
     throw err;
+  }
+}
+
+function getStaleLockReason() {
+  let raw = '';
+  try {
+    raw = fs.readFileSync(LOCK_PATH, 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT' ? 'lock disappeared before acquisition' : '';
+  }
+
+  let lock = null;
+  try {
+    lock = JSON.parse(raw);
+  } catch (_) {
+    return 'lock file is not valid JSON';
+  }
+
+  const pid = Number(lock.pid);
+  if (!Number.isInteger(pid) || pid <= 0) return 'lock file is missing a valid pid';
+  if (!isProcessRunning(pid)) return `pid ${pid} is no longer running`;
+  return '';
+}
+
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
   }
 }
 
@@ -551,17 +598,64 @@ async function findProfileMessageButton(page, ownerName) {
   return null;
 }
 
-async function waitForComposer(page, timeoutMs) {
+async function dismissOpenMessagingOverlays(page) {
+  let closed = 0;
+  const closePatterns = [/close/i, /dismiss/i];
+  const minimizePatterns = [/minimi[sz]e/i, /collapse/i];
+
+  for (const patterns of [closePatterns, minimizePatterns]) {
+    for (let pass = 0; pass < 4; pass++) {
+      const buttons = page.locator('[class*="msg-overlay"] button:visible, [class*="msg-conversation"] button:visible');
+      const count = await buttons.count().catch(() => 0);
+      let clicked = false;
+
+      for (let i = 0; i < count; i++) {
+        const button = buttons.nth(i);
+        const info = await button.evaluate((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            label: [
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('title') || '',
+              el.textContent || '',
+            ].join(' ').trim(),
+            disabled: el.disabled || el.getAttribute('aria-disabled') === 'true',
+            visible: rect.width > 0 && rect.height > 0,
+          };
+        }).catch(() => null);
+
+        if (!info || info.disabled || !info.visible) continue;
+        if (!patterns.some((pattern) => pattern.test(info.label))) continue;
+        if (/send/i.test(info.label)) continue;
+
+        await button.click({ delay: randomInt(30, 90) }).catch(() => {});
+        await page.waitForTimeout(250);
+        closed += 1;
+        clicked = true;
+        break;
+      }
+
+      if (!clicked) break;
+    }
+  }
+
+  if (closed > 0) {
+    console.log(`[playwright-draft] closed/minimized ${closed} existing messaging overlay control(s)`);
+    await page.waitForTimeout(500);
+  }
+}
+
+async function waitForComposer(page, timeoutMs, ownerName = '') {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const composer = await findComposer(page);
+    const composer = await findComposer(page, ownerName);
     if (composer) return composer;
     await page.waitForTimeout(300);
   }
   return null;
 }
 
-async function findComposer(page) {
+async function findComposer(page, ownerName = '') {
   const selectors = [
     '.msg-form__contenteditable[contenteditable="true"]',
     '.msg-form__msg-content-container div[contenteditable="true"]',
@@ -577,23 +671,55 @@ async function findComposer(page) {
   ];
 
   for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-    if (await locator.isVisible().catch(() => false)) return locator;
+    const locators = page.locator(selector);
+    const count = await locators.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const locator = locators.nth(i);
+      if (!(await locator.isVisible().catch(() => false))) continue;
+      if (!ownerName || await composerBelongsToOwner(locator, ownerName)) return locator;
+    }
   }
 
   const generic = page.locator('div[contenteditable="true"]:visible, [role="textbox"]:visible');
   const count = await generic.count().catch(() => 0);
-  if (count === 1) return generic.first();
+  if (count === 1) {
+    const only = generic.first();
+    if (!ownerName || await composerBelongsToOwner(only, ownerName)) return only;
+  }
 
   for (let i = 0; i < count; i++) {
     const candidate = generic.nth(i);
     const likely = await candidate.evaluate((el) =>
       !!el.closest('[role="dialog"], form, [class*="msg"], [class*="message"], [class*="compose"]')
     ).catch(() => false);
-    if (likely) return candidate;
+    if (likely && (!ownerName || await composerBelongsToOwner(candidate, ownerName))) return candidate;
   }
 
   return null;
+}
+
+async function composerBelongsToOwner(composer, ownerName) {
+  return composer.evaluate((el, name) => {
+    const normalize = (value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const owner = normalize(name);
+    const parts = owner.split(' ').filter((part) => part.length > 1);
+    if (!owner || parts.length === 0) return true;
+
+    let node = el;
+    for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
+      const text = normalize([
+        node.textContent || '',
+        node.getAttribute?.('aria-label') || '',
+        node.getAttribute?.('title') || '',
+      ].join(' '));
+
+      if (text.includes(owner)) return true;
+      if (parts.length > 1 && parts.every((part) => text.includes(part))) return true;
+      if (parts.length === 1 && text.includes(parts[0])) return true;
+    }
+
+    return false;
+  }, ownerName).catch(() => false);
 }
 
 async function clearComposer(page, composer) {
@@ -612,7 +738,12 @@ async function readComposerText(composer) {
   return composer.evaluate((el) => (el.innerText || el.textContent || '').trim()).catch(() => '');
 }
 
-async function findSendButton(page) {
+async function findSendButton(page, composer = null) {
+  if (composer) {
+    const scoped = await findSendButtonNearComposer(composer);
+    if (scoped) return scoped;
+  }
+
   const candidates = page.locator('.msg-form button:visible, [class*="msg-overlay"] button:visible, [role="dialog"] button:visible');
   const count = await candidates.count().catch(() => 0);
   for (let i = 0; i < count; i++) {
@@ -628,10 +759,55 @@ async function findSendButton(page) {
   return null;
 }
 
-async function waitForSendButton(page, timeoutMs) {
+async function findSendButtonNearComposer(composer) {
+  const rootHandle = await composer.evaluateHandle((el) => {
+    let best = el.closest('form') || el.parentElement;
+    let node = el;
+
+    for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
+      const className = typeof node.className === 'string' ? node.className : '';
+      const role = node.getAttribute?.('role') || '';
+      if (role === 'dialog' || /msg-overlay|conversation|msg-form|compose/i.test(className)) {
+        best = node;
+      }
+    }
+
+    return best || el;
+  }).catch(() => null);
+
+  const root = rootHandle?.asElement();
+  if (!root) {
+    await rootHandle?.dispose?.().catch(() => {});
+    return null;
+  }
+
+  const buttons = await root.$$('button').catch(() => []);
+  for (const button of buttons) {
+    const info = await button.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        text: (el.textContent || '').trim(),
+        ariaLabel: el.getAttribute('aria-label') || '',
+        disabled: el.disabled || el.getAttribute('aria-disabled') === 'true',
+        visible: rect.width > 0 && rect.height > 0,
+      };
+    }).catch(() => null);
+
+    if (!info || info.disabled || !info.visible) continue;
+    if (/^send\b/i.test(info.ariaLabel) || /^send$/i.test(info.text)) {
+      await rootHandle.dispose().catch(() => {});
+      return button;
+    }
+  }
+
+  await rootHandle.dispose().catch(() => {});
+  return null;
+}
+
+async function waitForSendButton(page, composer, timeoutMs) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const button = await findSendButton(page);
+    const button = await findSendButton(page, composer);
     if (button) return button;
     await page.waitForTimeout(250);
   }
