@@ -80,14 +80,18 @@ const saveIndicator   = document.getElementById('save-indicator');
 const previewBody     = document.getElementById('preview-body');
 const previewTarget   = document.getElementById('preview-target');
 
-// Send
+// Send + halt banner
 const sendBtn         = document.getElementById('send-btn');
 const sendStatusEl    = document.getElementById('send-status');
+const haltBanner      = document.getElementById('halt-banner');
+const haltReasonEl    = document.getElementById('halt-reason');
+const resetHaltBtn    = document.getElementById('reset-halt-btn');
 
 // Template editor state
 let templates         = {};   // id → { name, body, updated_at }
 let activeTemplateId  = null;
 let firstContact      = null; // contact used for live preview
+let isHalted          = false;
 
 // ============================================================
 // PDF.js worker
@@ -870,6 +874,11 @@ function updatePreview() {
 }
 
 function updateSendButton() {
+  if (isHalted) {
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'Send (halted)';
+    return;
+  }
   if (!firstContact) {
     sendBtn.disabled = true;
     sendBtn.textContent = 'Send';
@@ -1022,6 +1031,12 @@ function setStored(key, value) {
 // ============================================================
 // Send (PRD §5.5, §5.6)
 // ============================================================
+//
+// Orchestration lives in the background service worker so the popup
+// closing doesn't kill the send. Popup's job:
+//   1. Send a request to the background.
+//   2. Listen for progress updates (only delivered while popup is open).
+//   3. On every popup open, show the last completed send's result.
 
 sendBtn.addEventListener('click', async () => {
   if (!firstContact) return;
@@ -1030,197 +1045,91 @@ sendBtn.addEventListener('click', async () => {
   if (!message.trim()) return;
 
   sendBtn.disabled = true;
-  showSendStatus('Opening LinkedIn tab…', 'pending');
+  showSendStatus('Sending…', 'pending');
 
-  let tabId = null;
+  // Fire and forget — background handles the rest. We may or may not
+  // get a response here depending on whether the popup stays open.
   try {
-    // Open the contact's LinkedIn URL in a background tab so the popup stays
-    // open and can show progress + the result.
-    const tab = await chrome.tabs.create({
+    const response = await chrome.runtime.sendMessage({
+      type: 'send_to_contact',
       url: firstContact.linkedin_url,
-      active: false,
-    });
-    tabId = tab.id;
-
-    showSendStatus('Waiting for LinkedIn to load…', 'pending');
-    await waitForTabComplete(tabId);
-
-    // LinkedIn lazy-loads a lot of UI after `complete`. Give it a moment.
-    await sleep(1500);
-
-    showSendStatus('Sending message…', 'pending');
-
-    const [{ result } = {}] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: sendOnLinkedIn,
-      args: [message],
+      message,
+      contactName: firstContact.name,
     });
 
-    if (result?.ok) {
-      showSendStatus('✓ ' + (result.reason || 'Message sent'), 'ok');
-    } else {
-      showSendStatus('✗ ' + (result?.reason || 'Send failed (unknown error)'), 'err');
+    if (response?.ok) {
+      showSendStatus('✓ ' + (response.reason || 'Message sent'), 'ok');
+    } else if (response) {
+      showSendStatus('✗ ' + (response.reason || 'Send failed'), 'err');
     }
+    // else: popup closed before background replied — final result is in storage
   } catch (err) {
-    showSendStatus('✗ Error: ' + (err?.message || String(err)), 'err');
-    console.error('[send] failed:', err);
+    // Often happens when popup closes mid-send. Result still gets persisted
+    // by background; we'll show it on next popup open.
+    console.warn('[send] message channel closed:', err);
   } finally {
     updateSendButton();
   }
 });
+
+// Live progress updates from the background (only fire while popup is open)
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === 'send_progress') {
+    showSendStatus(msg.text, msg.kind || 'pending');
+  }
+});
+
+// On popup open, hydrate halt state and show the last send's result.
+(async function hydrateSendState() {
+  try {
+    const state = await new Promise((r) =>
+      chrome.storage.local.get(['halted', 'last_send_result', 'consecutive_failures'], r)
+    );
+
+    if (state.halted) {
+      isHalted = true;
+      haltBanner.style.display = 'flex';
+      haltReasonEl.textContent = state.halted.reason || '';
+    } else {
+      isHalted = false;
+      haltBanner.style.display = 'none';
+    }
+    updateSendButton();
+
+    // Show last completed send (within 30 min) even if popup was closed when it finished
+    const last = state.last_send_result;
+    if (last) {
+      const ageMs = Date.now() - new Date(last.when).getTime();
+      if (ageMs <= 30 * 60 * 1000) {
+        const prefix = last.ok ? '✓ ' : '✗ ';
+        const ago = humanAgo(ageMs);
+        const fc = state.consecutive_failures || 0;
+        const failTrail = (!last.ok && fc > 0 && !state.halted) ? ` (${fc}/3 failures)` : '';
+        showSendStatus(`${prefix}${last.contactName || 'last send'} — ${last.reason || ''}${failTrail} (${ago})`, last.ok ? 'ok' : 'err');
+      }
+    }
+  } catch (_) {}
+})();
+
+// Reset halt
+resetHaltBtn?.addEventListener('click', async () => {
+  try {
+    await chrome.runtime.sendMessage({ type: 'reset_halt' });
+  } catch (_) {}
+  isHalted = false;
+  haltBanner.style.display = 'none';
+  showSendStatus('Halt cleared. You can send again.', 'pending');
+  updateSendButton();
+});
+
+function humanAgo(ms) {
+  if (ms < 60_000) return 'just now';
+  if (ms < 3_600_000) return Math.round(ms / 60_000) + ' min ago';
+  return Math.round(ms / 3_600_000) + ' hr ago';
+}
 
 function showSendStatus(text, kind) {
   sendStatusEl.textContent = text;
   sendStatusEl.className = 'send-status show ' + kind;
 }
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-function waitForTabComplete(tabId) {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      try { chrome.tabs.onUpdated.removeListener(listener); } catch (_) {}
-      resolve();
-    };
-
-    const listener = (id, info) => {
-      if (id === tabId && info.status === 'complete') finish();
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-
-    // Maybe it's already loaded
-    chrome.tabs.get(tabId, (tab) => {
-      if (tab && tab.status === 'complete') finish();
-    });
-
-    // Hard cap
-    setTimeout(finish, 15000);
-  });
-}
-
-/**
- * Function injected into the LinkedIn tab. Self-contained — no closures over
- * popup-side variables, only the `messageText` arg.
- *
- * Strategy:
- *   1. Bail out early if URL is /search/, /login/, /checkpoint/.
- *   2. Find a Message button. If only InMail / Connect is available, classify
- *      and skip (do NOT consume an InMail credit, do NOT send a connect req).
- *   3. Click Message, wait for the dialog, find the contenteditable input.
- *   4. Type the message character-by-character with randomized delays.
- *   5. Verify the typed text actually landed.
- *   6. Click Send.
- *
- * Returns: { ok: boolean, reason: string }
- */
-async function sendOnLinkedIn(messageText) {
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const rand  = (min, max) => sleep(min + Math.random() * (max - min));
-
-  const findAny = (selectors) => {
-    for (const s of selectors) {
-      try {
-        const el = document.querySelector(s);
-        if (el) return el;
-      } catch (_) {}
-    }
-    return null;
-  };
-
-  // Wait for LinkedIn's heavy lazy-loaded UI to settle
-  await sleep(1500);
-
-  const url = window.location.href;
-
-  // Guards
-  if (/\/(login|checkpoint|authwall)/.test(url)) {
-    return { ok: false, reason: 'Not signed in to LinkedIn — please sign in and try again.' };
-  }
-  if (/\/search\//.test(url)) {
-    return {
-      ok: false,
-      reason: 'This is a LinkedIn search page, not a profile. Use a direct profile URL like https://www.linkedin.com/in/<handle>/',
-    };
-  }
-
-  // Locate the Message button. Fallback selectors in priority order.
-  const messageBtn = findAny([
-    'main button.message-anywhere-button',
-    'main button[aria-label^="Message "]',
-    '.pv-top-card button[aria-label^="Message"]',
-    '.entry-point button[aria-label*="Message"]',
-  ]);
-
-  if (!messageBtn) {
-    if (findAny(['button[aria-label^="Send InMail"]'])) {
-      return { ok: false, reason: 'Requires paid InMail — skipping (1st-degree connections only).' };
-    }
-    if (findAny(['button[aria-label^="Invite "]', 'button[aria-label*="connect" i]'])) {
-      return { ok: false, reason: 'Not yet a 1st-degree connection. Connect first, then message.' };
-    }
-    return { ok: false, reason: 'Could not find a Message button. Profile might be private or LinkedIn UI changed.' };
-  }
-
-  // Click Message → dialog opens
-  messageBtn.click();
-  await rand(900, 1500);
-
-  // Find the message input. LinkedIn renders it as a contenteditable div.
-  let input = null;
-  for (let attempt = 0; attempt < 8 && !input; attempt++) {
-    input = findAny([
-      'div.msg-form__contenteditable[contenteditable="true"]',
-      '.msg-form__msg-content-container div[contenteditable="true"]',
-      'div[role="textbox"][aria-label*="message" i]',
-    ]);
-    if (!input) await sleep(400);
-  }
-  if (!input) {
-    return { ok: false, reason: 'Message dialog opened but the input field never appeared.' };
-  }
-
-  // Focus, then type with randomized per-keystroke delay (PRD §6.6)
-  input.focus();
-  await sleep(250);
-
-  for (const ch of messageText) {
-    document.execCommand('insertText', false, ch);
-    // Sentence-boundary micro-pause
-    if (/[.!?]/.test(ch) && Math.random() < 0.7) {
-      await rand(200, 600);
-    } else {
-      await rand(40, 130);
-    }
-  }
-
-  await rand(400, 800);
-
-  // Verify the field actually has our text (PRD §6.6, §12.2)
-  const entered = (input.innerText || input.textContent || '').trim();
-  const expectedHead = messageText.trim().slice(0, 20);
-  if (!entered.includes(expectedHead.slice(0, 10))) {
-    return { ok: false, reason: 'Typed text did not appear in the message field — aborting before send.' };
-  }
-
-  // Click Send
-  await rand(400, 900);
-  const sendButton = findAny([
-    'button.msg-form__send-button',
-    'button[type="submit"][class*="send" i]',
-    '.msg-form__right-actions button',
-  ]);
-  if (!sendButton) {
-    return { ok: false, reason: 'Send button not found. Message was typed but not sent.' };
-  }
-  if (sendButton.disabled) {
-    return { ok: false, reason: 'Send button is disabled. Message was typed but not sent.' };
-  }
-
-  sendButton.click();
-  await sleep(1500);
-
-  return { ok: true, reason: `Message sent.` };
-}
