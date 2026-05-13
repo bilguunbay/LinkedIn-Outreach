@@ -3,191 +3,275 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>LinkedIn Outreach</title>
+    <title>Outreach</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <main class="shell">
+    <main class="app">
+
+      <!-- ── Topbar ─────────────────────────────────────────── -->
       <header class="topbar">
-        <div>
-          <h1>LinkedIn Outreach</h1>
-          <p>Upload contacts, preview a message, and send from your local LinkedIn browser session.</p>
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"></div>
+          <div class="brand-text">
+            <h1>Outreach</h1>
+            <p>Personal LinkedIn dispatch</p>
+          </div>
         </div>
         <div class="top-actions">
-          <button id="refresh-safety" class="icon-btn" title="Refresh safety status">↻</button>
-          <button id="open-settings" class="primary">Safety Settings</button>
+          <button id="refresh-safety" class="btn btn-ghost btn-icon icon-btn" title="Refresh">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>
+              <path d="M21 3v5h-5"/>
+            </svg>
+          </button>
+          <button id="open-settings" class="btn btn-secondary primary">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06A2 2 0 1 1 4.27 16.97l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+            Safety settings
+          </button>
         </div>
       </header>
 
-      <section class="safety-band" id="safety-band">
-        <div>
-          <span class="label">Today</span>
-          <strong id="today-count">0 / 5</strong>
+      <!-- ── Status grid ────────────────────────────────────── -->
+      <section class="status-grid safety-band" id="safety-band">
+        <div class="stat">
+          <span class="stat-label label">Today</span>
+          <span class="stat-value" id="today-count">0 / 5</span>
+          <div class="stat-bar"><div class="stat-bar-fill" id="today-bar" style="width: 0%"></div></div>
         </div>
-        <div>
-          <span class="label">Active Hours</span>
-          <strong id="active-hours">09:00-18:00</strong>
+        <div class="stat">
+          <span class="stat-label label">Window</span>
+          <span class="stat-value" id="active-hours">09:00–18:00</span>
         </div>
-        <div>
-          <span class="label">Delay</span>
-          <strong id="delay-range">60-180s</strong>
+        <div class="stat">
+          <span class="stat-label label">Delay</span>
+          <span class="stat-value" id="delay-range">60–180s</span>
         </div>
-        <div>
-          <span class="label">Failures</span>
-          <strong id="failure-count">0 / 3</strong>
+        <div class="stat">
+          <span class="stat-label label">Failures</span>
+          <span class="stat-value" id="failure-count">0 / 3</span>
         </div>
-        <div>
-          <span class="label">Queue</span>
-          <strong id="queue-state">Idle</strong>
+        <div class="stat">
+          <span class="stat-label label">Queue</span>
+          <span class="stat-value" id="queue-state">Idle</span>
         </div>
-        <div class="halt-box" id="halt-box">
-          <span class="label">Halt</span>
-          <strong id="halt-state">Clear</strong>
-          <button id="reset-halt" class="secondary small">Reset</button>
+        <div class="stat halt-stat halt-box" id="halt-box">
+          <span class="stat-label label">Halt</span>
+          <span class="stat-value with-dot">
+            <span class="dot dot-ok" aria-hidden="true"></span>
+            <span id="halt-state">Clear</span>
+          </span>
+          <button id="reset-halt" class="btn btn-link secondary small">Reset</button>
         </div>
       </section>
 
+      <!-- ── Workspace ──────────────────────────────────────── -->
       <section class="workspace">
+
         <aside class="side">
+
           <div class="panel">
-            <h2>Contacts</h2>
+            <div class="panel-head">
+              <h2>Contacts</h2>
+            </div>
             <label class="dropzone" for="csv-file">
               <input id="csv-file" type="file" accept=".csv,text/csv">
-              <span>Choose CSV</span>
-              <small>Company, Founder / CEO, LinkedIn URL, Role</small>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <span class="dropzone-title">Upload a CSV</span>
+              <small class="dropzone-hint">Company · Founder/CEO · LinkedIn URL · Role</small>
             </label>
-            <div id="upload-summary" class="muted">No file loaded.</div>
+            <p id="upload-summary" class="muted">No file loaded.</p>
           </div>
 
           <div class="panel">
-            <h2>Message</h2>
+            <div class="panel-head">
+              <h2>Message</h2>
+            </div>
             <textarea id="message-template" rows="8">Hi {{name}},
 
 Hope you're doing well. I wanted to reach out about {{company}}.</textarea>
             <div class="template-vars">
-              <button data-var="{{name}}">name</button>
-              <button data-var="{{full_name}}">full name</button>
-              <button data-var="{{company}}">company</button>
-              <button data-var="{{role}}">role</button>
+              <button data-var="{{name}}">{{name}}</button>
+              <button data-var="{{full_name}}">{{full_name}}</button>
+              <button data-var="{{company}}">{{company}}</button>
+              <button data-var="{{role}}">{{role}}</button>
             </div>
             <div class="preview">
-              <span class="label">Preview</span>
+              <span class="preview-label label">Preview</span>
               <p id="message-preview">Upload a CSV to preview the first contact.</p>
             </div>
           </div>
+
         </aside>
 
-        <section class="main-panel">
-          <div class="table-header">
-            <div>
-              <h2>Send Queue</h2>
-              <p id="queue-subtitle">Upload a CSV to begin.</p>
+        <section class="main">
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Send queue</h2>
+              <p id="queue-subtitle" class="muted">Upload a CSV to begin.</p>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Company</th>
+                    <th>Person</th>
+                    <th>Role</th>
+                    <th>LinkedIn</th>
+                    <th>Status</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="contacts-body">
+                  <tr><td colspan="6" class="empty">No contacts loaded.</td></tr>
+                </tbody>
+              </table>
             </div>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Company</th>
-                  <th>Person</th>
-                  <th>Role</th>
-                  <th>LinkedIn</th>
-                  <th>Status</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody id="contacts-body">
-                <tr><td colspan="6" class="empty">No contacts loaded.</td></tr>
-              </tbody>
-            </table>
-          </div>
-          <div class="job-panel" id="job-panel">
-            <div>
-              <span class="label">Current Job</span>
-              <strong id="job-title">Idle</strong>
+
+          <div class="panel" id="job-panel">
+            <div class="panel-head">
+              <h2>Current job</h2>
+              <strong id="job-title" class="job-title">Idle</strong>
             </div>
-            <div class="job-grid">
+            <dl class="memo job-grid">
               <div>
-                <span class="label">Phase</span>
-                <strong id="job-phase">-</strong>
+                <dt class="label">Phase</dt>
+                <dd id="job-phase">—</dd>
               </div>
               <div>
-                <span class="label">Elapsed</span>
-                <strong id="job-elapsed">-</strong>
+                <dt class="label">Elapsed</dt>
+                <dd id="job-elapsed">—</dd>
               </div>
               <div>
-                <span class="label">Last Update</span>
-                <strong id="job-last-update">-</strong>
+                <dt class="label">Last update</dt>
+                <dd id="job-last-update">—</dd>
               </div>
               <div>
-                <span class="label">Queue</span>
-                <strong id="job-queue-position">-</strong>
+                <dt class="label">Queue</dt>
+                <dd id="job-queue-position">—</dd>
               </div>
-            </div>
-            <p id="job-guidance">No active send. Queue a contact to see live progress here.</p>
+            </dl>
+            <p id="job-guidance" class="job-guidance">No active send. Queue a contact to see live progress.</p>
           </div>
+
         </section>
+
       </section>
 
-      <section class="activity">
-        <div class="activity-head">
-          <h2>Activity Log</h2>
-          <button id="clear-log" class="secondary small">Clear</button>
+      <!-- ── Activity log ───────────────────────────────────── -->
+      <section class="panel log-panel activity">
+        <div class="panel-head activity-head">
+          <h2>Activity log</h2>
+          <button id="clear-log" class="btn btn-link secondary small">Clear</button>
         </div>
         <pre id="activity-log">Ready.</pre>
       </section>
+
     </main>
 
-    <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <!-- ── Safety Settings modal ──────────────────────────── -->
+    <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <div class="modal-panel">
         <div class="modal-head">
-          <h2>Safety Settings</h2>
-          <button id="close-settings" class="icon-btn" title="Close">×</button>
+          <h2 id="settings-title">Safety settings</h2>
+          <button id="close-settings" class="btn btn-ghost btn-icon icon-btn" title="Close">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M18 6 6 18M6 6l12 12"/>
+            </svg>
+          </button>
         </div>
-        <div class="risk-note">
-          <strong>Changing these limits increases account risk.</strong>
-          LinkedIn prohibits unauthorized automated message sending. Higher caps, wider active hours,
-          and shorter delays can make automated behavior easier to detect. You are choosing to take
-          on that risk when you save changes here.
+        <div class="modal-body">
+          <div class="risk-note">
+            <strong>Changing these limits increases account risk.</strong>
+            LinkedIn prohibits automated message sending. Higher caps, wider active hours,
+            and shorter delays make automated behavior easier to detect.
+          </div>
+          <div class="settings-grid">
+            <label>
+              <span>Daily new-profile cap</span>
+              <input id="setting-daily-cap" type="number" min="1" max="10">
+            </label>
+            <label>
+              <span>Active hours</span>
+              <input id="setting-active-hours" type="text" placeholder="09:00-18:00">
+            </label>
+            <label>
+              <span>Min delay before send (sec)</span>
+              <input id="setting-min-delay" type="number" min="0" max="3600">
+            </label>
+            <label>
+              <span>Max delay before send (sec)</span>
+              <input id="setting-max-delay" type="number" min="0" max="3600">
+            </label>
+          </div>
+          <div class="override-grid">
+            <label>
+              <input id="setting-allow-repeat" type="checkbox">
+              Allow repeat sends to profiles already messaged by this tool.
+            </label>
+            <label>
+              <input id="setting-allow-duplicate-message" type="checkbox">
+              Allow exact duplicate message text sent in the last 7 days.
+            </label>
+          </div>
+          <label class="ack">
+            <input id="risk-ack" type="checkbox">
+            I understand these changes may increase LinkedIn account restriction risk.
+          </label>
         </div>
-        <div class="settings-grid">
-          <label>
-            Daily new-profile cap
-            <input id="setting-daily-cap" type="number" min="1" max="10">
-          </label>
-          <label>
-            Active hours
-            <input id="setting-active-hours" type="text" placeholder="09:00-18:00">
-          </label>
-          <label>
-            Min delay before send (sec)
-            <input id="setting-min-delay" type="number" min="0" max="3600">
-          </label>
-          <label>
-            Max delay before send (sec)
-            <input id="setting-max-delay" type="number" min="0" max="3600">
-          </label>
-        </div>
-        <div class="override-grid">
-          <label>
-            <input id="setting-allow-repeat" type="checkbox">
-            Allow repeat sends to profiles already messaged by this tool
-          </label>
-          <label>
-            <input id="setting-allow-duplicate-message" type="checkbox">
-            Allow exact duplicate message text sent in the last 7 days
-          </label>
-        </div>
-        <label class="ack">
-          <input id="risk-ack" type="checkbox">
-          I understand these changes may increase LinkedIn account restriction risk.
-        </label>
         <div class="modal-actions">
-          <button id="save-settings" class="danger">Save Risk Settings</button>
-          <button id="cancel-settings" class="secondary">Cancel</button>
+          <button id="cancel-settings" class="btn btn-ghost secondary">Cancel</button>
+          <button id="save-settings" class="btn btn-danger danger">Save risk settings</button>
         </div>
       </div>
     </div>
+
+    <!-- Today progress bar + halt observer (no app.js changes) -->
+    <script>
+      // Reflect Today X/Y on the progress bar
+      (function syncTodayBar() {
+        const valEl = document.getElementById('today-count');
+        const barEl = document.getElementById('today-bar');
+        if (!valEl || !barEl) return;
+        const update = () => {
+          const m = (valEl.textContent || '').match(/(\d+)\s*\/\s*(\d+)/);
+          if (!m) return;
+          const used = Number(m[1]), cap = Math.max(Number(m[2]), 1);
+          barEl.style.width = Math.min(100, Math.round((used / cap) * 100)) + '%';
+        };
+        update();
+        new MutationObserver(update).observe(valEl, {
+          childList: true, characterData: true, subtree: true
+        });
+      })();
+
+      // Add .is-halted to the halt cell when halt-state is non-clear
+      (function observeHalt() {
+        const cell  = document.getElementById('halt-box');
+        const state = document.getElementById('halt-state');
+        if (!cell || !state) return;
+        const update = () => {
+          const text = (state.textContent || '').trim().toLowerCase();
+          const halted = text && text !== 'clear' && text !== '—' && text !== '-';
+          cell.classList.toggle('is-halted', !!halted);
+        };
+        update();
+        new MutationObserver(update).observe(state, {
+          childList: true, characterData: true, subtree: true
+        });
+      })();
+    </script>
 
     <script src="/app.js"></script>
   </body>
